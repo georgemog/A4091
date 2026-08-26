@@ -97,7 +97,6 @@ module gary
 	output       sel_cia, //select CIA space
 	output       sel_cia_a, //select cia A
 	output       sel_cia_b, //select cia B
-	output       sel_rtg, //select rtg
 	output       sel_rtc, //select $DCxxxx
 	output       sel_ide, //select $DAxxxx
 	output       sel_gayle, //select $DExxxx
@@ -193,7 +192,6 @@ assign sel_reg   = cpu_address_in[23:21]==3'b110 ? ~(|t_sel_slow | sel_rtc | sel
 assign sel_cia   = cpu_address_in[23:16]==8'hBF; // $BFxxxx
 assign sel_cia_a = sel_cia & ~cpu_address_in[12];
 assign sel_cia_b = sel_cia & ~cpu_address_in[13];
-assign sel_rtg   = cpu_address_in[23:16]==8'hB8; // $B8xxxxx
 assign sel_bank_1 = cpu_address_in[23:21]==3'b001;
 
 assign sel_toccata = toccata_ena && cpu_address_in[23:16]==toccata_base; // Nominally $e9xxxx

@@ -327,6 +327,9 @@ wire toccata_ena;
 wire a2065_ena;
 wire [7:0] a2065_base;
 
+wire       rtg_reg_ena;
+wire [7:0] rtg_reg_base;
+
 wire        cdtv_mode;
 wire  [7:0] cdtv_base;
 wire [15:0] cdtv_din_w;
@@ -375,6 +378,8 @@ cpu_wrapper cpu_wrapper
 	.toccata_ena  (toccata_ena     ),
 	.a2065_ena    (a2065_ena       ),
 	.a2065_base   (a2065_base      ),
+	.rtg_ena      (rtg_reg_ena     ),
+	.rtg_base     (rtg_reg_base    ),
 	.toccata_base (toccata_base    ),
 	.cdtv_base    (cdtv_base       ),
 	.cdtv_mode    (cdtv_mode       ),
@@ -610,6 +615,9 @@ fastchip fastchip
 	.sel          (fastchip_sel      ),
 	.sel_ack      (fastchip_selack   ),
 	.ready        (fastchip_ready    ),
+
+	.rtg_reg_ena  (rtg_reg_ena       ),
+	.rtg_reg_base (rtg_reg_base     ),
 
 	.addr         ({chip_addr,1'b0}  ),
 	.din          (chip_din          ),

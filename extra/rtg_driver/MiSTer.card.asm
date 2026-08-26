@@ -24,6 +24,8 @@
         include hardware/intbits.i
         include exec/exec.i
         include lvo/exec_lib.i
+        include lvo/expansion_lib.i
+        include expansion/expansion.i
 
 ; If you define the Debug Symbol make sure the monitor file is in
 ; sys:storage/monitors - debug output seems to crash the system if
@@ -84,21 +86,24 @@ BUG MACRO
 ;       section ReplayRTG,code
 ****************************************************************************
 MEMORY_SIZE   EQU $800000   ; 8MB framebuffer
-MEMORY_BASE   EQU $02000000
-REGISTER_BASE EQU $b80100
+
+; Board is now two separate AutoConfig'd Zorro II boards instead of one fixed
+; address (or the earlier single-Zorro-III-window design) -- see
+; rtg/IMPLEMENTATION_PLAN.md. FindCard() locates each independently via its
+; own FindConfigDev() call; there's no compile-time MEMORY_BASE/REGISTER_BASE
+; and no window-offset math anymore, each board's own cd_BoardAddr is what's
+; needed directly.
+RTG_MANUFACTURER   EQU $139C  ; "Minimig" mfr ID -- shared with the Z3 boards
+RTG_REG_PRODUCT    EQU $03    ; regs+CLUT board ($20, then $30, tried first -- see rtg/IMPLEMENTATION_PLAN.md)
+RTG_FB_PRODUCT     EQU $04    ; framebuffer board (claims the fixed $200000 Z2 RAM slot)
+RTG_REG_SUB_OFFSET EQU $000100 ; control regs+CLUT sub-block, within the regs board's own 64KB window
 
 FB_BASE EQU $27000000 ; MiSTer physical memory address
 
-; B80100:B80101 :  8:0 : ADDR[24:16]
-; B80102:B80103 : 15:0 : ADDR[15:0]
-; B80104:B80105 : 5:0  : FORMAT[5:0]
-; B80106:B80107 :    0 : ENABLE
-; B80108:B80109 : 11:0 : HSIZE
-; B8010A:B8010B : 11:0 : VSIZE
-; B8010C:B8010D : 13:0 : STRIDE
-; B8010E:B8010F :  7:0 : ID = 50 / VERSION = 01
-
-; B80400..B807FF CLUT : 256 * 32bits 00 / RR / GG / BB
+; RegisterBase+$100 : ADDR[24:16] / ADDR[15:0] / FORMAT[5:0] / ENABLE /
+;                      HSIZE / VSIZE / STRIDE / ID=50,VERSION=01
+;   (offsets REG_ADDRESS..REG_ID below, unchanged from the fixed-address design)
+; RegisterBase+$400..$7FF : CLUT : 256 * 32bits 00 / RR / GG / BB
 
 REG_ADDRESS EQU 0
 REG_FORMAT  EQU 4
@@ -329,11 +334,60 @@ FindCard:
 ;  BoardInfo struct supplied by the caller, the rtg.library, for example
 ;  the MemoryBase, MemorySize and RegisterBase fields.
 
-        move.l  #MEMORY_SIZE  ,PSSO_BoardInfo_MemorySize(a0)
-        move.l  #REGISTER_BASE,PSSO_BoardInfo_RegisterBase(a0)
-        move.l  #MEMORY_BASE  ,PSSO_BoardInfo_MemoryBase(a0)
-        
+;  a0: struct BoardInfo   a6: our own card base (standard exec vector-table
+;  call convention -- this table was built via InitResident/MakeLibrary same
+;  as any other library, so -30(a6)/-36(a6) get the same a6=libBase guarantee
+;  as Open/Close do)
+;
+;  Two independent Zorro II boards now (regs+CLUT, and framebuffer -- see
+;  rtg/IMPLEMENTATION_PLAN.md), each found via its own FindConfigDev() call.
+;  Both must be present; if either is missing this reports failure without
+;  attempting to unclaim a board already found (a partial RTG core build
+;  isn't a real supported configuration).
+
+        movem.l a2/a3/a4/a5/a6,-(sp)
+        movea.l a0,a2                       ; a2 = bi, survives the library calls
+        movea.l CARD_EXPANSIONBASE(a6),a5   ; a5 = expansion.library base (a6 gets reused per call below)
+
+        movea.l a5,a6
+        suba.l  a0,a0                       ; a0 = oldConfigDev = NULL
+        move.l  #RTG_MANUFACTURER,d0
+        move.l  #RTG_REG_PRODUCT,d1
+        jsr     _LVOFindConfigDev(a6)
+        movea.l d0,a3                       ; a3 = regs board's ConfigDev, or NULL
+        tst.l   a3
+        beq     .notfound
+
+        movea.l a5,a6
+        suba.l  a0,a0
+        move.l  #RTG_MANUFACTURER,d0
+        move.l  #RTG_FB_PRODUCT,d1
+        jsr     _LVOFindConfigDev(a6)
+        movea.l d0,a4                       ; a4 = framebuffer board's ConfigDev, or NULL
+        tst.l   a4
+        beq     .notfound
+
+        movea.l a2,a0                       ; a0 = bi again
+
+        bclr    #CDB_CONFIGME,cd_Flags(a3)  ; claim both so nothing else grabs them
+        bclr    #CDB_CONFIGME,cd_Flags(a4)
+
+        move.l  cd_BoardAddr(a3),d0
+        addi.l  #RTG_REG_SUB_OFFSET,d0      ; d0 = register block base
+        move.l  cd_BoardAddr(a4),d1         ; d1 = framebuffer base (no sub-offset -- own board now)
+
+        move.l  #MEMORY_SIZE,PSSO_BoardInfo_MemorySize(a0)
+        move.l  d0,          PSSO_BoardInfo_RegisterBase(a0)
+        move.l  d1,          PSSO_BoardInfo_MemoryBase(a0)
+
         moveq   #-1,d0
+        bra.s   .exit
+
+.notfound:
+        moveq   #0,d0
+
+.exit:
+        movem.l (sp)+,a2/a3/a4/a5/a6
         rts
 
 ;------------------------------------------------------------------------------
@@ -614,9 +668,10 @@ SetPanning:
 ;  these values you will have to calculate the LinearStartingAddress
 ;  fields of the CRTC registers.
 
+        move.l  PSSO_BoardInfo_MemoryBase(a0),d1
         movea.l PSSO_BoardInfo_RegisterBase(a0),a0
         move.l  a1,d0
-        sub.l   #MEMORY_BASE,d0
+        sub.l   d1,d0
         add.l   #FB_BASE,d0
         BUG     "RTG:ADDRESS = %lx",d0
         move.l  d0,REG_ADDRESS(a0)

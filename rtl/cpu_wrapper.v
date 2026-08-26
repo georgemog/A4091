@@ -72,6 +72,10 @@ module cpu_wrapper
 	output            a2065_ena,
 	output reg  [7:0] a2065_base,
 
+	output            rtg_ena,
+	output reg  [7:0] rtg_base,
+	output reg        rtg_fb_ena,
+
 	input             cdtv_mode,
 	output reg  [7:0] cdtv_base,
 
@@ -119,6 +123,7 @@ memory_router u_memory_router
 	.z3ram_ena0    (z3ram_ena0    ),
 	.z3ram_base1   (z3ram_base1   ),
 	.z3ram_ena1    (z3ram_ena1    ),
+	.rtg_fb_ena    (rtg_fb_ena    ),
 	.sel_chipram   (sel_chipram   ),
 	.sel_kickram   (sel_kickram   ),
 	.sel_zram      (sel_zram      ),
@@ -386,6 +391,8 @@ end
 
 reg       ac_toccata;
 reg       ac_a2065;
+reg       ac_rtg;
+reg       ac_rtg_fb;
 reg       ac_cdtv;
 reg [2:0] ac_memcard;
 reg [3:0] autocfg_data;
@@ -405,8 +412,32 @@ always @(*) begin
 			default: autocfg_data = 4'b1111;
 		endcase
 	end
-	// Zorro II RAM (Up to 8 meg at 0x200000). It has a fixed base, so it must be first in the chain.
-	else if (~ac_memcard[2] && ac_memcard[1:0]) begin
+	// RTG framebuffer (Zorro II, 8MB, mfr=0x139c product=0x04, not added to
+	// free-memory list -- it's device memory, not general RAM). Claims the
+	// exact same fixed $200000-$9FFFFF slot plain Z2 fast RAM would use
+	// (mirrors the Z2RAM arm's fixed-base shortcut below), unconditionally
+	// offered whenever this core is built -- placed first in the chain, like
+	// Z2RAM's own comment says it must be, so it always wins that slot over
+	// fastramcfg's plain Z2 RAM option. You get one or the other, matching
+	// real period Zorro II address scarcity -- see rtg/IMPLEMENTATION_PLAN.md.
+	else if(ac_rtg_fb) begin
+		case (chip_addr[6:1])
+			6'b000000: autocfg_data = 4'b1100;	// Zorro-II card, no link, no ROM, not add-mem
+			6'b000001: autocfg_data = 4'b0000;	// 8MB
+			6'b000011: autocfg_data = 4'b1011;	// er_Product low nibble -> 0x04
+			6'b001000: autocfg_data = 4'b1110;	// Manufacturer ID: 0x139c
+			6'b001001: autocfg_data = 4'b1100;
+			6'b001010: autocfg_data = 4'b0110;
+			6'b001011: autocfg_data = 4'b0011;
+			  default:;
+		endcase
+	end
+	// Zorro II RAM (Up to 8 meg at 0x200000). It has a fixed base, so it must
+	// be first in the chain -- suppressed once RTG's framebuffer has claimed
+	// that slot (rtg_fb_ena stays latched high, unlike ac_rtg_fb which clears
+	// once configured, so this stays suppressed on every later probe cycle
+	// too, not just while ac_rtg_fb is still pending).
+	else if (~ac_memcard[2] && ac_memcard[1:0] && ~rtg_fb_ena) begin
 		case (chip_addr[6:1])
 			6'b000000: autocfg_data = 4'b1110;
 			6'b000001:
@@ -473,6 +504,28 @@ always @(*) begin
 			default: ;
 		endcase
 	end
+	// RTG regs+CLUT (Zorro II, 64KB IO board, mfr=0x139c product=0x03, no
+	// link, no ROM). Same mfr/base pattern as Toccata/A2065 above -- a real
+	// dynamic 8-bit base register (reg $48), so its assigned address always
+	// falls within the low 16MB space this core's legacy chip-bus decode can
+	// already reach; no dedicated Zorro III window needed for this half.
+	// (product=0x20 was tried first but collides with a real existing board,
+	// Rok Krajnc's "Minimig Z3 EthernetCard"; 0x30 tried next, worked but
+	// showed as unidentified/generic alongside the framebuffer's 0x31 --
+	// moved to 0x03/0x04 for the pair. See rtg/IMPLEMENTATION_PLAN.md.)
+	else if(ac_rtg) begin
+		case (chip_addr[6:1])
+			6'h0: autocfg_data = 4'b1100; // Zorro-II card, no link, no ROM
+			6'h1: autocfg_data = 4'b0001; // size 64KB
+			// Inverted from here on
+			6'h3: autocfg_data = 4'b1100; // er_Product low nibble -> 0x03
+			6'h8: autocfg_data = 4'b1110; // er_Manufacturer high high
+			6'h9: autocfg_data = 4'b1100; // er_Manufacturer high low
+			6'ha: autocfg_data = 4'b0110; // er_Manufacturer low high
+			6'hb: autocfg_data = 4'b0011; // er_Manufacturer low low -> 0x139c
+			default: ;
+		endcase
+	end
 	// Zorro III RAM 128MB/256MB/384MB
 	else if(ac_memcard[2]) begin
 		case (chip_addr[6:1])
@@ -491,7 +544,7 @@ always @(*) begin
 	end
 end
 
-wire sel_autoconfig = (chip_addr[23:16] == 8'b11101000) && (ac_memcard || ac_toccata || ac_a2065 || ac_cdtv); //$E80000 - $E8FFFF
+wire sel_autoconfig = (chip_addr[23:16] == 8'b11101000) && (ac_memcard || ac_toccata || ac_a2065 || ac_rtg || ac_rtg_fb || ac_cdtv); //$E80000 - $E8FFFF
 
 always @(posedge clk) begin
 	reg old_uds;
@@ -501,6 +554,9 @@ always @(posedge clk) begin
 		ac_memcard  <= cpucfg[1] ? fastramcfg : fastramcfg[2] ? 3'd3 : {1'b0, fastramcfg[1:0]};
 		ac_toccata  <= cdtv_mode ? 1'b0 : 1'b1;
 		ac_a2065    <= 1;
+		ac_rtg      <= 1;
+		ac_rtg_fb   <= 1;
+		rtg_fb_ena  <= 0;
 		ac_cdtv     <= cdtv_mode;
 		cdtv_base   <= 8'hE9;
 		z2ram_ena   <= 0;
@@ -519,7 +575,13 @@ always @(posedge clk) begin
 				ac_cdtv   <= 0;
 			end
 		end
-		else if(~ac_memcard[2] && ac_memcard[1:0]) begin
+		else if(ac_rtg_fb) begin
+			if (chip_addr[6:1] == 6'b100100) begin // Register 0x48 - config, RTG framebuffer (fixed $200000 Z2 slot)
+				rtg_fb_ena <= 1;
+				ac_rtg_fb  <= 0;
+			end
+		end
+		else if(~ac_memcard[2] && ac_memcard[1:0] && ~rtg_fb_ena) begin
 			if (chip_addr[6:1] == 6'b100100) begin // Register 0x48 - config, ZII RAM
 				z2ram_ena <= 1;
 				ac_memcard <= 0;
@@ -535,6 +597,12 @@ always @(posedge clk) begin
 			if (chip_addr[6:1] == 6'b100100) begin // Register 0x48 - config, A2065 Ethernet
 				a2065_base <= cpu_dout[7:0];
 				ac_a2065<=0;
+			end
+		end
+		else if(ac_rtg) begin
+			if (chip_addr[6:1] == 6'b100100) begin // Register 0x48 - config, RTG regs/CLUT board
+				rtg_base <= cpu_dout[7:0];
+				ac_rtg   <= 0;
 			end
 		end
 		else if(ac_memcard[2]) begin
@@ -556,5 +624,6 @@ end
 
 assign toccata_ena = ~ac_toccata & ~cdtv_mode;
 assign a2065_ena   = ~ac_a2065;
+assign rtg_ena    = ~ac_rtg;
 
 endmodule

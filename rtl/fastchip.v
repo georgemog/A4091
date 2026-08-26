@@ -29,6 +29,12 @@ module fastchip
 	output        sel_ack, // 1 when fast chip is used instead of legacy chip
 	output        ready,
 
+	// RTG regs/CLUT board's own AutoConfig identity (distinct names from the
+	// rtg_ena/rtg_base pair below, which are the *framebuffer's* display
+	// control signals -- different board, different meaning, same module).
+	input         rtg_reg_ena,
+	input   [7:0] rtg_reg_base,
+
 	input  [23:0] addr,
 	input  [15:0] din,
 	output [15:0] dout,
@@ -245,7 +251,7 @@ gayle gayle
 	.led(ide_led)
 );
 
-wire        sel_rtg = sel && !sel_akiko && (addr[23:12] == 'hB80);
+wire        sel_rtg = sel && !sel_akiko && rtg_reg_ena && (addr[23:16] == rtg_reg_base);
 wire [15:0] rtg_dout;
 wire        rtg_ready;
 

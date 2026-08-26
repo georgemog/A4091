@@ -17,6 +17,8 @@ module memory_router
 	input   [3:0] z3ram_base1,
 	input         z3ram_ena1,
 
+	input         rtg_fb_ena,
+
 	output        sel_chipram,
 	output        sel_kickram,
 	output        sel_kicklower,
@@ -32,10 +34,15 @@ module memory_router
 
 assign sel_z3ram0   = (cpu_addr[31:27] == z3ram_base0) && z3ram_ena0;
 assign sel_z3ram1   = (cpu_addr[31:28] == z3ram_base1) && z3ram_ena1;
-assign sel_z2ram    = !cpu_addr[31:24] && (cpu_addr[23] ^ |cpu_addr[22:21]) && z2ram_ena; // addr[23:21] = 1..4
+// Z2 fast RAM and the RTG framebuffer both live at the fixed $200000-$9FFFFF
+// Zorro II slot -- mutually exclusive (rtg_fb_ena latches once RTG's own
+// autoconfig arm claims it, see cpu_wrapper.v), so only one of these two
+// is ever actually enabled at a time. Guarded here too, not just at the
+// autoconfig level, so the hardware decode itself can't double-answer.
+assign sel_z2ram    = !cpu_addr[31:24] && (cpu_addr[23] ^ |cpu_addr[22:21]) && z2ram_ena && ~rtg_fb_ena; // addr[23:21] = 1..4
+assign sel_rtg      = !cpu_addr[31:24] && (cpu_addr[23] ^ |cpu_addr[22:21]) && rtg_fb_ena;
 assign sel_zram     = sel_z3ram0 | sel_z3ram1 | sel_z2ram;
 assign sel_dd       = (cpu_addr[31:16] == 16'h00DD) && (cpu_addr[15:13] == 3'b010);
-assign sel_rtg      = (cpu_addr[31:24] == 8'h02);
 
 // don't sel_kickram when writing
 assign sel_kickram   = !cpu_addr[31:24] && (&cpu_addr[23:19] || (!cdtv_mode && cpu_addr[23:19] == 5'b11100) || (cpu_addr[23:19] == 5'b10101) || (cpu_addr[23:19] == 5'b10110)) && ckick && wr;
