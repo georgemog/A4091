@@ -34,13 +34,15 @@ module memory_router
 
 assign sel_z3ram0   = (cpu_addr[31:27] == z3ram_base0) && z3ram_ena0;
 assign sel_z3ram1   = (cpu_addr[31:28] == z3ram_base1) && z3ram_ena1;
-// Z2 fast RAM and the RTG framebuffer both live at the fixed $200000-$9FFFFF
-// Zorro II slot -- mutually exclusive (rtg_fb_ena latches once RTG's own
-// autoconfig arm claims it, see cpu_wrapper.v), so only one of these two
-// is ever actually enabled at a time. Guarded here too, not just at the
-// autoconfig level, so the hardware decode itself can't double-answer.
-assign sel_z2ram    = !cpu_addr[31:24] && (cpu_addr[23] ^ |cpu_addr[22:21]) && z2ram_ena && ~rtg_fb_ena; // addr[23:21] = 1..4
-assign sel_rtg      = !cpu_addr[31:24] && (cpu_addr[23] ^ |cpu_addr[22:21]) && rtg_fb_ena;
+// Z2 fast RAM: fixed $200000-$9FFFFF Zorro II slot. RTG's framebuffer
+// AutoConfig's itself into this same slot for real -- ConfigDev, cd_BoardAddr
+// and CDB_CONFIGME all genuine, matched here in the RTL decode too (see
+// ramaddr[22:19] below for the base-offset correction this requires, since
+// this board's Zorro base ($200000) isn't zero unlike a fixed-address board
+// would be) -- so Z2 fast RAM stays excluded here whenever rtg_fb_ena is
+// latched.
+assign sel_z2ram = !cpu_addr[31:24] && (cpu_addr[23] ^ |cpu_addr[22:21]) && z2ram_ena && ~rtg_fb_ena; // addr[23:21] = 1..4
+assign sel_rtg   = rtg_fb_ena && !cpu_addr[31:24] && (cpu_addr[23] ^ |cpu_addr[22:21]);                // $200000-$9FFFFF
 assign sel_zram     = sel_z3ram0 | sel_z3ram1 | sel_z2ram;
 assign sel_dd       = (cpu_addr[31:16] == 16'h00DD) && (cpu_addr[15:13] == 3'b010);
 
@@ -63,7 +65,19 @@ assign sel_chipram   = !cpu_addr[31:21] && cchip;
 assign ramaddr[28]    = sel_z2ram | sel_z3ram1;
 assign ramaddr[27]    = sel_z3ram0 | (sel_z3ram1 & cpu_addr[27]);
 assign ramaddr[26:23] = (sel_z3ram0 | sel_z3ram1) ? cpu_addr[26:23] : (sel_rtg ? 4'b1110 : {4{sel_dd}});
-assign ramaddr[22:19] = {4{sel_dd}} | cpu_addr[22:19];
+// sel_rtg's window select (cpu_addr[23:21] = 1..4, see sel_z2ram above)
+// passes cpu_addr[22:19] straight through as if the board's own zero-offset
+// coincided with cpu_addr==0 -- but this board's Zorro base is $200000, not
+// $0. The raw bits are off by exactly one 2MB window (4 blocks of this
+// 4-bit field's 512KB granularity), which silently rotates the whole 8MB
+// physical window: Zorro-offset-0 (the framebuffer's own pixel (0,0), where
+// the driver/P96 actually write) would otherwise land at physical DDR3
+// offset $200000 instead of offset 0, while the ARM-side video scanout
+// reads from a fixed physical offset 0 -- so every pixel/cursor write would
+// miss the bytes actually being displayed (this was the corruption/blank-
+// screen/no-cursor bug traced during development; see
+// rtg/IMPLEMENTATION_PLAN.md). Subtracting 4'd4 (mod 16) undoes the rotation.
+assign ramaddr[22:19] = sel_rtg ? (cpu_addr[22:19] - 4'd4) : ({4{sel_dd}} | cpu_addr[22:19]);
 assign ramaddr[18]    =    sel_dd   | (sel_kicklower & bootrom) | cpu_addr[18];
 assign ramaddr[17:16] = {2{sel_dd}} | cpu_addr[17:16];
 assign ramaddr[15:1]  = cpu_addr[15:1];

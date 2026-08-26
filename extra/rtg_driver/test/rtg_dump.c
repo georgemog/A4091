@@ -78,7 +78,29 @@ int main(void)
     printf("  ENABLE     : %u        %s\n", enable & 1,
            (enable & 1) ? "(RTG output should be live)" : "(RTG output OFF -- driver never enabled it)");
     printf("  BASE       : $%08X  (framebuffer address the FPGA scans out from)\n", base);
-    printf("  FORMAT     : $%02X\n", format & 0x1F);
+    {
+        /* FB_FORMAT[2:0] encoding, per sys/emu_ports.vh:43 (this project's
+           own framework header, not guessed): 011=8bpp(palette) 100=16bpp
+           101=24bpp 110=32bpp. Bytes/pixel follows directly from that. */
+        const char *depth_name;
+        int bytes_per_pixel;
+        switch (format & 0x07) {
+            case 3:  depth_name = "8bpp indexed (palette/CLUT)"; bytes_per_pixel = 1; break;
+            case 4:  depth_name = "16bpp RGB";                   bytes_per_pixel = 2; break;
+            case 5:  depth_name = "24bpp RGB";                   bytes_per_pixel = 3; break;
+            case 6:  depth_name = "32bpp RGBA";                  bytes_per_pixel = 4; break;
+            default: depth_name = "unrecognised/reserved code";  bytes_per_pixel = 0; break;
+        }
+        printf("  FORMAT     : $%02X  (%s)\n", format & 0x1F, depth_name);
+        if (bytes_per_pixel > 0) {
+            UWORD expected_stride = (UWORD)(hsize * bytes_per_pixel);
+            printf("               %d byte%s/pixel -- STRIDE for HSIZE=%u would be %u"
+                   " (currently %u%s)\n",
+                   bytes_per_pixel, bytes_per_pixel == 1 ? "" : "s",
+                   hsize & 0x0FFF, expected_stride, stride & 0x3FFF,
+                   (expected_stride == (stride & 0x3FFF)) ? ", matches" : ", MISMATCH");
+        }
+    }
     printf("  HSIZE      : %u\n", hsize & 0x0FFF);
     printf("  VSIZE      : %u\n", vsize & 0x0FFF);
     printf("  STRIDE     : %u bytes/line\n", stride & 0x3FFF);

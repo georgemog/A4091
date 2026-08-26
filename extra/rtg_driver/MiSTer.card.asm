@@ -95,8 +95,13 @@ MEMORY_SIZE   EQU $800000   ; 8MB framebuffer
 ; needed directly.
 RTG_MANUFACTURER   EQU $139C  ; "Minimig" mfr ID -- shared with the Z3 boards
 RTG_REG_PRODUCT    EQU $03    ; regs+CLUT board ($20, then $30, tried first -- see rtg/IMPLEMENTATION_PLAN.md)
-RTG_FB_PRODUCT     EQU $04    ; framebuffer board (claims the fixed $200000 Z2 RAM slot)
+RTG_FB_PRODUCT     EQU $04    ; framebuffer board, AutoConfig's into the genuine $200000 Z2 slot
 RTG_REG_SUB_OFFSET EQU $000100 ; control regs+CLUT sub-block, within the regs board's own 64KB window
+
+; Framebuffer's pixel-poking address is its real AutoConfig'd cd_BoardAddr
+; ($200000) -- rtl/memory_router.v decodes and base-corrects this board's
+; DDR3 offset properly now, so cd_BoardAddr matches reality and PMMU page
+; descriptors built from it are correct. See rtg/IMPLEMENTATION_PLAN.md.
 
 FB_BASE EQU $27000000 ; MiSTer physical memory address
 
@@ -374,7 +379,7 @@ FindCard:
 
         move.l  cd_BoardAddr(a3),d0
         addi.l  #RTG_REG_SUB_OFFSET,d0      ; d0 = register block base
-        move.l  cd_BoardAddr(a4),d1         ; d1 = framebuffer base (no sub-offset -- own board now)
+        move.l  cd_BoardAddr(a4),d1          ; d1 = framebuffer base (real AutoConfig'd $200000)
 
         move.l  #MEMORY_SIZE,PSSO_BoardInfo_MemorySize(a0)
         move.l  d0,          PSSO_BoardInfo_RegisterBase(a0)
@@ -826,9 +831,36 @@ WaitVerticalSync:
 ;------------------------------------------------------------------------------
 ;  a0:  struct BoardInfo
 ;  This function waits for the next horizontal retrace.
+;
+;  Was a stub (rts only) -- P96's software cursor uses this as its frame
+;  timing anchor to redraw the pointer, so a stub that never actually
+;  waits starves cursor tracking of any timing reference. Real wait using
+;  the beam position counter, per the author's own "can simply use VPOSR
+;  for this" comment below, now implemented.
+;
+;  $DFF004/$DFF006 (VPOSR/VHPOSR) read as one longword: bit16 = V8 (MSB
+;  of vertical position), bits15:8 = V7-V0, bits30:17 = chip ID (present,
+;  non-zero, MUST be masked out or this could spin forever waiting for a
+;  zero that never comes). Verified against the Amiga Hardware Reference
+;  Manual, not guessed -- a wrong bit here hangs the whole machine.
+;
+;  Double-wait catches a genuine frame transition rather than possibly
+;  already sitting in the brief line-0 window: first wait until we're
+;  NOT at line 0, then wait until we ARE -- that edge is the start of
+;  the next frame. Safe against hanging because the beam position is a
+;  free-running hardware counter, not dependent on any software state.
+
         BUG     "WaitVerticalSync"
 
-; On minimig can simply use VPOSR for this
+.wait_not_zero:
+        move.l  $dff004,d0
+        and.l   #$0001FF00,d0
+        beq.s   .wait_not_zero
+
+.wait_for_zero:
+        move.l  $dff004,d0
+        and.l   #$0001FF00,d0
+        bne.s   .wait_for_zero
 
 .wait_done:
         rts
