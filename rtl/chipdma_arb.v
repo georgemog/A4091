@@ -158,7 +158,8 @@ memory_router u_router
 	.z3ram_ena0    (z3ram_ena0),
 	.z3ram_base1   (z3ram_base1),
 	.z3ram_ena1    (z3ram_ena1),
-	.rtg_fb_ena    (1'b0), // DMA masters (akiko/cdtv) never target the RTG framebuffer
+	.rtg_base      (5'b0),
+	.rtg_ena       (1'b0), // DMA masters (akiko/cdtv) never target the RTG framebuffer
 	.ramaddr       (router_ramaddr)
 );
 

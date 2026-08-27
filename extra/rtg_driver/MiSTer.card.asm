@@ -87,21 +87,18 @@ BUG MACRO
 ****************************************************************************
 MEMORY_SIZE   EQU $800000   ; 8MB framebuffer
 
-; Board is now two separate AutoConfig'd Zorro II boards instead of one fixed
-; address (or the earlier single-Zorro-III-window design) -- see
-; rtg/IMPLEMENTATION_PLAN.md. FindCard() locates each independently via its
-; own FindConfigDev() call; there's no compile-time MEMORY_BASE/REGISTER_BASE
-; and no window-offset math anymore, each board's own cd_BoardAddr is what's
-; needed directly.
-RTG_MANUFACTURER   EQU $139C  ; "Minimig" mfr ID -- shared with the Z3 boards
-RTG_REG_PRODUCT    EQU $03    ; regs+CLUT board ($20, then $30, tried first -- see rtg/IMPLEMENTATION_PLAN.md)
-RTG_FB_PRODUCT     EQU $04    ; framebuffer board, AutoConfig's into the genuine $200000 Z2 slot
-RTG_REG_SUB_OFFSET EQU $000100 ; control regs+CLUT sub-block, within the regs board's own 64KB window
-
-; Framebuffer's pixel-poking address is its real AutoConfig'd cd_BoardAddr
-; ($200000) -- rtl/memory_router.v decodes and base-corrects this board's
-; DDR3 offset properly now, so cd_BoardAddr matches reality and PMMU page
-; descriptors built from it are correct. See rtg/IMPLEMENTATION_PLAN.md.
+; Single Zorro III board now (mfr=0x139C product=0x30, "Rok Krajnc Minimig
+; Z3 GraphicsCard") combining the regs+CLUT block and the framebuffer into
+; one AutoConfig'd allocation -- one FindConfigDev() call, one cd_BoardAddr.
+; Framebuffer lives at board offset 0; regs+CLUT at board offset
+; RTG_REGS_OFFSET. See rtl/memory_router.v (sel_rtg) and
+; rtl/cpu_wrapper.v (fastchip_sel gating) for the RTL side, and
+; rtg/LESSONS_LEARNED.md for why the earlier Zorro II framebuffer design
+; needed offset-math correction that a Zorro III dynamic base does not.
+RTG_MANUFACTURER   EQU $139C   ; "Minimig" mfr ID -- shared with the Z3 boards
+RTG_PRODUCT        EQU $30     ; combined regs+CLUT+framebuffer board
+RTG_REGS_OFFSET    EQU $800000 ; regs+CLUT sub-block, within the board's own window
+RTG_REG_SUB_OFFSET EQU $000100 ; control regs+CLUT sub-block, within that 64KB region
 
 FB_BASE EQU $27000000 ; MiSTer physical memory address
 
@@ -344,42 +341,30 @@ FindCard:
 ;  as any other library, so -30(a6)/-36(a6) get the same a6=libBase guarantee
 ;  as Open/Close do)
 ;
-;  Two independent Zorro II boards now (regs+CLUT, and framebuffer -- see
-;  rtg/IMPLEMENTATION_PLAN.md), each found via its own FindConfigDev() call.
-;  Both must be present; if either is missing this reports failure without
-;  attempting to unclaim a board already found (a partial RTG core build
-;  isn't a real supported configuration).
+;  Single combined Zorro III board now (regs+CLUT and framebuffer share one
+;  AutoConfig'd allocation) -- one FindConfigDev() call, one cd_BoardAddr.
 
-        movem.l a2/a3/a4/a5/a6,-(sp)
-        movea.l a0,a2                       ; a2 = bi, survives the library calls
-        movea.l CARD_EXPANSIONBASE(a6),a5   ; a5 = expansion.library base (a6 gets reused per call below)
+        movem.l a2/a3/a5/a6,-(sp)
+        movea.l a0,a2                       ; a2 = bi, survives the library call
+        movea.l CARD_EXPANSIONBASE(a6),a5   ; a5 = expansion.library base (a6 gets reused below)
 
         movea.l a5,a6
         suba.l  a0,a0                       ; a0 = oldConfigDev = NULL
         move.l  #RTG_MANUFACTURER,d0
-        move.l  #RTG_REG_PRODUCT,d1
+        move.l  #RTG_PRODUCT,d1
         jsr     _LVOFindConfigDev(a6)
-        movea.l d0,a3                       ; a3 = regs board's ConfigDev, or NULL
+        movea.l d0,a3                       ; a3 = board's ConfigDev, or NULL
         tst.l   a3
-        beq     .notfound
-
-        movea.l a5,a6
-        suba.l  a0,a0
-        move.l  #RTG_MANUFACTURER,d0
-        move.l  #RTG_FB_PRODUCT,d1
-        jsr     _LVOFindConfigDev(a6)
-        movea.l d0,a4                       ; a4 = framebuffer board's ConfigDev, or NULL
-        tst.l   a4
         beq     .notfound
 
         movea.l a2,a0                       ; a0 = bi again
 
-        bclr    #CDB_CONFIGME,cd_Flags(a3)  ; claim both so nothing else grabs them
-        bclr    #CDB_CONFIGME,cd_Flags(a4)
+        bclr    #CDB_CONFIGME,cd_Flags(a3)  ; claim it so nothing else grabs it
 
         move.l  cd_BoardAddr(a3),d0
-        addi.l  #RTG_REG_SUB_OFFSET,d0      ; d0 = register block base
-        move.l  cd_BoardAddr(a4),d1          ; d1 = framebuffer base (real AutoConfig'd $200000)
+        move.l  d0,d1
+        addi.l  #RTG_REGS_OFFSET+RTG_REG_SUB_OFFSET,d0 ; d0 = register block base
+                                                        ; d1 = framebuffer base (board offset 0)
 
         move.l  #MEMORY_SIZE,PSSO_BoardInfo_MemorySize(a0)
         move.l  d0,          PSSO_BoardInfo_RegisterBase(a0)
@@ -392,7 +377,7 @@ FindCard:
         moveq   #0,d0
 
 .exit:
-        movem.l (sp)+,a2/a3/a4/a5/a6
+        movem.l (sp)+,a2/a3/a5/a6
         rts
 
 ;------------------------------------------------------------------------------

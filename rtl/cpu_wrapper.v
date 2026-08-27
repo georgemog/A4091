@@ -72,9 +72,13 @@ module cpu_wrapper
 	output            a2065_ena,
 	output reg  [7:0] a2065_base,
 
+	// rtg_ena/rtg_base here feed fastchip.v's regs+CLUT sub-block decode
+	// only -- rtg_base is a FIXED offset within the combined Zorro III
+	// board (not a captured AutoConfig register; the board's own dynamic
+	// Zorro III base lives in the internal rtg_z3_base/rtg_z3_ena pair
+	// below). See memory_router.v's sel_rtg for the framebuffer half.
 	output            rtg_ena,
-	output reg  [7:0] rtg_base,
-	output reg        rtg_fb_ena,
+	output      [7:0] rtg_base,
 
 	input             cdtv_mode,
 	output reg  [7:0] cdtv_base,
@@ -123,7 +127,8 @@ memory_router u_memory_router
 	.z3ram_ena0    (z3ram_ena0    ),
 	.z3ram_base1   (z3ram_base1   ),
 	.z3ram_ena1    (z3ram_ena1    ),
-	.rtg_fb_ena    (rtg_fb_ena    ),
+	.rtg_base      (rtg_z3_base   ),
+	.rtg_ena       (rtg_z3_ena    ),
 	.sel_chipram   (sel_chipram   ),
 	.sel_kickram   (sel_kickram   ),
 	.sel_zram      (sel_zram      ),
@@ -178,7 +183,15 @@ always @* begin
 		chip_addr    = cpu_addr_p[23:1];
 		chip_din     = cpu_dout_p;
 		chip_data    = chipdout_i;
-		fastchip_sel = cpu_req & !cpu_addr_p[31:24];
+		// Legacy low-16MB chip bus (fastchip.v/rtg regs submodule can only
+		// ever see the low 24 address bits, via chip_addr above) OR the
+		// combined RTG board's regs+CLUT sub-range ($800000-$FFFFFF of its
+		// own Zorro III window) -- fastchip.v's own addr[23:16]==rtg_base
+		// compare (rtg_base fixed at 8'h80) does the final 64KB selection;
+		// this just needs to admit the right board+sub-range in the first
+		// place, same rtg_z3_base/rtg_z3_ena the framebuffer half uses.
+		fastchip_sel = cpu_req & (!cpu_addr_p[31:24] |
+		               (rtg_z3_ena && (cpu_addr_p[31:27] == rtg_z3_base) && (cpu_addr_p[26:23] == 4'b0001)));
 		fastchip_lw  = longword;
 	end
 	else begin
@@ -392,10 +405,16 @@ end
 reg       ac_toccata;
 reg       ac_a2065;
 reg       ac_rtg;
-reg       ac_rtg_fb;
 reg       ac_cdtv;
 reg [2:0] ac_memcard;
 reg [3:0] autocfg_data;
+
+// RTG board's own Zorro III base -- 128MB granularity, same mechanism as
+// z3ram_base0 (see the capture logic below). rtg_base/rtg_ena (the module
+// ports) are a DIFFERENT, fixed pair feeding only fastchip.v's regs+CLUT
+// sub-decode; this is the board's real, dynamic, OS-assigned base.
+reg  [4:0] rtg_z3_base;
+reg        rtg_z3_ena;
 
 
 always @(*) begin
@@ -412,32 +431,10 @@ always @(*) begin
 			default: autocfg_data = 4'b1111;
 		endcase
 	end
-	// RTG framebuffer (Zorro II, 8MB, mfr=0x139c product=0x04, not added to
-	// free-memory list -- it's device memory, not general RAM). Claims the
-	// exact same fixed $200000-$9FFFFF slot plain Z2 fast RAM would use
-	// (mirrors the Z2RAM arm's fixed-base shortcut below), unconditionally
-	// offered whenever this core is built -- placed first in the chain, like
-	// Z2RAM's own comment says it must be, so it always wins that slot over
-	// fastramcfg's plain Z2 RAM option. You get one or the other, matching
-	// real period Zorro II address scarcity -- see rtg/IMPLEMENTATION_PLAN.md.
-	else if(ac_rtg_fb) begin
-		case (chip_addr[6:1])
-			6'b000000: autocfg_data = 4'b1100;	// Zorro-II card, no link, no ROM, not add-mem
-			6'b000001: autocfg_data = 4'b0000;	// 8MB
-			6'b000011: autocfg_data = 4'b1011;	// er_Product low nibble -> 0x04
-			6'b001000: autocfg_data = 4'b1110;	// Manufacturer ID: 0x139c
-			6'b001001: autocfg_data = 4'b1100;
-			6'b001010: autocfg_data = 4'b0110;
-			6'b001011: autocfg_data = 4'b0011;
-			  default:;
-		endcase
-	end
 	// Zorro II RAM (Up to 8 meg at 0x200000). It has a fixed base, so it must
-	// be first in the chain -- suppressed once RTG's framebuffer has claimed
-	// that slot (rtg_fb_ena stays latched high, unlike ac_rtg_fb which clears
-	// once configured, so this stays suppressed on every later probe cycle
-	// too, not just while ac_rtg_fb is still pending).
-	else if (~ac_memcard[2] && ac_memcard[1:0] && ~rtg_fb_ena) begin
+	// be first in the chain. Independent of RTG now -- RTG lives entirely
+	// in Zorro III space, see the combined RTG board branch further below.
+	else if (~ac_memcard[2] && ac_memcard[1:0]) begin
 		case (chip_addr[6:1])
 			6'b000000: autocfg_data = 4'b1110;
 			6'b000001:
@@ -504,26 +501,38 @@ always @(*) begin
 			default: ;
 		endcase
 	end
-	// RTG regs+CLUT (Zorro II, 64KB IO board, mfr=0x139c product=0x03, no
-	// link, no ROM). Same mfr/base pattern as Toccata/A2065 above -- a real
-	// dynamic 8-bit base register (reg $48), so its assigned address always
-	// falls within the low 16MB space this core's legacy chip-bus decode can
-	// already reach; no dedicated Zorro III window needed for this half.
-	// (product=0x20 was tried first but collides with a real existing board,
-	// Rok Krajnc's "Minimig Z3 EthernetCard"; 0x30 tried next, worked but
-	// showed as unidentified/generic alongside the framebuffer's 0x31 --
-	// moved to 0x03/0x04 for the pair. See rtg/IMPLEMENTATION_PLAN.md.)
+	// RTG combined board (Zorro III, mfr=0x139c product=0x30 -- "Rok Krajnc
+	// Minimig Z3 GraphicsCard"). Single AutoConfig'd 128MB window holding
+	// BOTH the 8MB framebuffer (board offset 0-$7FFFFF, DDR3-backed, see
+	// memory_router.v's sel_rtg) AND the 64KB regs+CLUT block (board offset
+	// $800000-$80FFFF, routed via fastchip.v -- see fastchip_sel's gating
+	// above). Not add-mem: device memory, not general RAM.
+	//
+	// er_Type ($00, NOT inverted): 1000 = ERT_ZORROIII(bit7=1,bit6=0),
+	// ERTF_MEMLIST=0 (not add-mem), ERTF_DIAGVALID=0 (no rom).
+	// er_Type low nibble / extended size code ($01, NOT inverted): 0000 =
+	// size class 0 -> 16MB*2^0 = 16MB (see the 128MB/256MB Z3 RAM board's
+	// own code=3/4 for the same 16MB*2^code progression, confirmed against
+	// its real, working showconfig output).
+	// er_Product ($02/$03, inverted): high nibble 0x3 (~0011=1100), low
+	// nibble 0x0 (default).
+	// er_Flags ($04/$05, inverted): high nibble 1111 real (MEMSPACE=1,
+	// NOSHUTUP=1, EXTENDED=1, ZORRO_III=1) -- same as the Z3 RAM board.
+	// Low nibble (Z3 sub-size) 0000 real -- no sub-sizing, full 16MB.
+	// er_Manufacturer ($08-$0B, inverted): 0x139C, same as every other
+	// board here.
 	else if(ac_rtg) begin
 		case (chip_addr[6:1])
-			6'h0: autocfg_data = 4'b1100; // Zorro-II card, no link, no ROM
-			6'h1: autocfg_data = 4'b0001; // size 64KB
-			// Inverted from here on
-			6'h3: autocfg_data = 4'b1100; // er_Product low nibble -> 0x03
-			6'h8: autocfg_data = 4'b1110; // er_Manufacturer high high
-			6'h9: autocfg_data = 4'b1100; // er_Manufacturer high low
-			6'ha: autocfg_data = 4'b0110; // er_Manufacturer low high
-			6'hb: autocfg_data = 4'b0011; // er_Manufacturer low low -> 0x139c
-			default: ;
+			6'b000000: autocfg_data = 4'b1000;	// Zorro-III card, no ROM, not add-mem
+			6'b000001: autocfg_data = 4'b0000;	// size class 0 -> 16MB (extended)
+			6'b000010: autocfg_data = 4'b1100;	// er_Product high nibble -> 0x3
+			6'b000100: autocfg_data = 4'b0000;	// er_Flags: extended, Zorro III, not silenceable
+			6'b000101: autocfg_data = 4'b1111;	// er_Flags low: no sub-size override
+			6'b001000: autocfg_data = 4'b1110;	// Manufacturer ID: 0x139c
+			6'b001001: autocfg_data = 4'b1100;
+			6'b001010: autocfg_data = 4'b0110;
+			6'b001011: autocfg_data = 4'b0011;
+			  default:;
 		endcase
 	end
 	// Zorro III RAM 128MB/256MB/384MB
@@ -544,7 +553,7 @@ always @(*) begin
 	end
 end
 
-wire sel_autoconfig = (chip_addr[23:16] == 8'b11101000) && (ac_memcard || ac_toccata || ac_a2065 || ac_rtg || ac_rtg_fb || ac_cdtv); //$E80000 - $E8FFFF
+wire sel_autoconfig = (chip_addr[23:16] == 8'b11101000) && (ac_memcard || ac_toccata || ac_a2065 || ac_rtg || ac_cdtv); //$E80000 - $E8FFFF
 
 always @(posedge clk) begin
 	reg old_uds;
@@ -555,8 +564,7 @@ always @(posedge clk) begin
 		ac_toccata  <= cdtv_mode ? 1'b0 : 1'b1;
 		ac_a2065    <= 1;
 		ac_rtg      <= 1;
-		ac_rtg_fb   <= 1;
-		rtg_fb_ena  <= 0;
+		rtg_z3_ena  <= 0;
 		ac_cdtv     <= cdtv_mode;
 		cdtv_base   <= 8'hE9;
 		z2ram_ena   <= 0;
@@ -575,13 +583,7 @@ always @(posedge clk) begin
 				ac_cdtv   <= 0;
 			end
 		end
-		else if(ac_rtg_fb) begin
-			if (chip_addr[6:1] == 6'b100100) begin // Register 0x48 - config, RTG framebuffer (fixed $200000 Z2 slot)
-				rtg_fb_ena <= 1;
-				ac_rtg_fb  <= 0;
-			end
-		end
-		else if(~ac_memcard[2] && ac_memcard[1:0] && ~rtg_fb_ena) begin
+		else if(~ac_memcard[2] && ac_memcard[1:0]) begin
 			if (chip_addr[6:1] == 6'b100100) begin // Register 0x48 - config, ZII RAM
 				z2ram_ena <= 1;
 				ac_memcard <= 0;
@@ -600,9 +602,10 @@ always @(posedge clk) begin
 			end
 		end
 		else if(ac_rtg) begin
-			if (chip_addr[6:1] == 6'b100100) begin // Register 0x48 - config, RTG regs/CLUT board
-				rtg_base <= cpu_dout[7:0];
-				ac_rtg   <= 0;
+			if (chip_addr[6:1] == 6'b100010) begin // Register 0x44, assign base address to RTG's Zorro III window (128MB granularity, same as z3ram_base0 below)
+				rtg_z3_base <= cpu_dout[15:11];
+				rtg_z3_ena  <= 1;
+				ac_rtg      <= 0;
 			end
 		end
 		else if(ac_memcard[2]) begin
@@ -624,6 +627,11 @@ end
 
 assign toccata_ena = ~ac_toccata & ~cdtv_mode;
 assign a2065_ena   = ~ac_a2065;
-assign rtg_ena    = ~ac_rtg;
+// Feeds fastchip.v's regs+CLUT sub-decode only (see fastchip_sel above for
+// the actual board-window gating) -- rtg_base is a fixed offset within the
+// combined board (board-offset $800000, i.e. addr[23:16]==8'h80), not a
+// captured AutoConfig register.
+assign rtg_ena  = rtg_z3_ena;
+assign rtg_base = 8'h80;
 
 endmodule
