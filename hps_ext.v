@@ -84,7 +84,27 @@ module hps_ext
 	output reg        cdtv_cs_card,
 	input             cdtv_req,
 	input             cdtv_nvr_dirty,
-	input             cdtv_card_dirty
+	input             cdtv_card_dirty,
+
+	// ---- A4091 software-SIOP bridge mailbox -----------------------------
+	// Rides on hps_ext (the generic hps_io UIO loop is not polled for Minimig).
+	// Main_MiSTer: a4091_hps_thread() in support/minimig/minimig_a4091.cpp.
+	//   'h64  poll     : status word (kick/int/soft-reset/SIGP/dma flags)
+	//   'h65  regs rd   : burst-read the 256-byte shadow register RAM
+	//   'h66  regs wr   : burst-write the shadow register RAM
+	//   'h67  control   : byte -> {set_int, clr_int, clr_kick, clr_srst, cache_clr}
+	//   'h68  dbg        : compact 64-bit heartbeat bus
+	input      [15:0] a4091_mbx_status,    // -> 'h64
+	output reg  [7:0] a4091_mbx_addr,      // shadow-RAM index for 'h65 / 'h66
+	output reg        a4091_mbx_regs_wr,
+	output reg  [7:0] a4091_mbx_wdata,
+	input       [7:0] a4091_mbx_rdata,     // regs[a4091_mbx_addr], 1 clk latency
+	output reg        a4091_mbx_set_int,
+	output reg        a4091_mbx_clr_int,
+	output reg        a4091_mbx_clr_kick,
+	output reg        a4091_mbx_clr_srst,
+	output reg        a4091_mbx_cache_clr,
+	input      [63:0] a4091_dbg_bus        // heartbeat snapshot, read via cmd 'h68
 );
 
 assign EXT_BUS[15:0] = io_fpga ? fpga_dout : io_dout;
@@ -120,6 +140,15 @@ always@(posedge clk_sys) begin : main_proc
 	cdda_wr <= 0;
 	{akiko_rd, akiko_wr} <= 0;
 	{cdtv_rd, cdtv_wr} <= 0;
+
+	// A4091 bridge mailbox: all pulses are 1 cycle
+	a4091_mbx_regs_wr   <= 0;
+	a4091_mbx_set_int   <= 0;
+	a4091_mbx_clr_int   <= 0;
+	a4091_mbx_clr_kick  <= 0;
+	a4091_mbx_clr_srst  <= 0;
+	a4091_mbx_cache_clr <= 0;
+
 	if((ide_rd | ide_wr) & ~&ide_addr[3:0]) ide_addr <= ide_addr + 1'd1;
 
 	if(~io_uio) begin
@@ -165,10 +194,47 @@ always@(posedge clk_sys) begin : main_proc
 
 		if(byte_cnt == 0) begin
 			cmd <= io_din;
-			dout_en <= (io_din >= EXT_CMD_MIN && io_din <= EXT_CMD_MAX) || (io_din >= EXT_CMD_MIN2 && io_din <= EXT_CMD_MAX2);
+			dout_en <= (io_din >= EXT_CMD_MIN && io_din <= EXT_CMD_MAX) || (io_din >= EXT_CMD_MIN2 && io_din <= EXT_CMD_MAX2)
+			          || (io_din == 'h64) || (io_din == 'h65) || (io_din == 'h68);
 			if(io_din == 'h63) io_dout <= {2'b00, cdtv_card_dirty, cdtv_nvr_dirty, akiko_req, akiko_sec_req, akiko_rx_busy, cdda_req, akiko_nvr_dirty, cdtv_req, ide_req};
 			if(io_din == UIO_GET_VMODE) io_dout <= 1;
+			// A4091 bridge poll -> status word (kick/int/srst/SIGP/dma)
+			if(io_din == 'h64) io_dout <= a4091_mbx_status;
+			// A4091 bridge shadow-reg burst: rewind the RAM index. The bridge
+			// tracks mbx_rdata = regs[a4091_mbx_addr] with 1 clk latency; the
+			// idle gap before strobe 1 covers it.
+			if(io_din == 'h65 || io_din == 'h66) a4091_mbx_addr <= 0;
+			// A4091 bridge heartbeat: words 1..4 = dbg_bus[15:0..63:48]
+			if(io_din == 'h68) io_dout <= a4091_dbg_bus[15:0];
 		end else begin
+			// --- A4091 bridge mailbox continuation ---
+			if(cmd == 'h68) begin
+				if(byte_cnt == 1) io_dout <= a4091_dbg_bus[31:16];
+				if(byte_cnt == 2) io_dout <= a4091_dbg_bus[47:32];
+				if(byte_cnt == 3) io_dout <= a4091_dbg_bus[63:48];
+			end
+			// 'h65: FPGA -> HPS shadow-reg burst read. io_dout at strobe K
+			// (K>=1) = regs[K-1]. Main issues cmd + one throwaway read + 256.
+			if(cmd == 'h65) begin
+				io_dout        <= {8'd0, a4091_mbx_rdata};
+				a4091_mbx_addr <= a4091_mbx_addr + 1'b1;
+			end
+			// 'h66: HPS -> FPGA shadow-reg burst write. Strobe K (K>=1) carries
+			// regs[K-1]; the pulse is consumed on the following (idle) clk.
+			if(cmd == 'h66) begin
+				if(byte_cnt >= 2) a4091_mbx_addr <= a4091_mbx_addr + 1'b1;
+				a4091_mbx_wdata   <= io_din[7:0];
+				a4091_mbx_regs_wr <= 1'b1;
+			end
+			// 'h67: control byte -> mailbox pulses
+			//   bit0 set_int  bit1 clr_int  bit2 clr_kick  bit3 clr_srst  bit4 cache_clr
+			if(cmd == 'h67 && byte_cnt == 1) begin
+				a4091_mbx_set_int   <= io_din[0];
+				a4091_mbx_clr_int   <= io_din[1];
+				a4091_mbx_clr_kick  <= io_din[2];
+				a4091_mbx_clr_srst  <= io_din[3];
+				a4091_mbx_cache_clr <= io_din[4];
+			end
 			case(cmd)
 
 				UIO_MOUSE:

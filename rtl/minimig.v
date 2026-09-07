@@ -314,7 +314,10 @@ module minimig
 	output [63:0] a2065_mem_writedata,
 	output [7:0]  a2065_mem_byteenable,
 	output        a2065_mem_write,
-	input         a2065_mem_waitrequest
+	input         a2065_mem_waitrequest,
+
+	// A4091 Zorro III SCSI (software SIOP) interrupt
+	input         a4091_int2
 );
 
 
@@ -565,7 +568,7 @@ paula PAULA1
 	.sof(sof),
 	.strhor(strhor_paula),
 	.vblint(vbl_int),
-	.int2(int2|(ide_fast ? ide_ext_irq : gayle_irq)|a2065_int2_sync|akiko_irq|cdtv_irq_w),
+	.int2(int2|(ide_fast ? ide_ext_irq : gayle_irq)|a2065_int2_sync|akiko_irq|cdtv_irq_w|a4091_int2),
 	.int3(int3),
 	.int6(int6 | int6_toccata),
 	._ipl(_iplx),

@@ -96,8 +96,44 @@ module cpu_wrapper
 	output reg  [3:0] z3ram_base1,
 	output reg        z3ram_ena1,
 
-	output            dcache_sw_en
+	output            dcache_sw_en,
+
+	// ---- A4091 Zorro III NCR 53C710 SCSI - software SIOP bridge (see A4091/)
+	// The 53C710 model / SCRIPTS VM / SCSI-2 target run on the HPS ARM; the
+	// FPGA side is autoconfig + boot ROM + register window + shadow-reg RAM.
+	// No FPGA DMA master: the ARM moves DATA phases straight into HPS DDR.
+	input             a4091_ena,
+	input       [2:0] a4091_scsi_id,
+	input       [4:0] a4091_dip,
+	output            a4091_int2,
+	output            a4091_cache_clr,
+	input             a4091_rom_wr,
+	input      [15:0] a4091_rom_addr,
+	input       [7:0] a4091_rom_data,
+	// HPS bridge mailbox (hps_ext.v <-> a4091_bridge)
+	input       [7:0] a4091_mbx_addr,
+	input             a4091_mbx_regs_wr,
+	input       [7:0] a4091_mbx_wdata,
+	output      [7:0] a4091_mbx_rdata,
+	input             a4091_mbx_set_int,
+	input             a4091_mbx_clr_int,
+	input             a4091_mbx_clr_kick,
+	input             a4091_mbx_clr_srst,
+	input             a4091_mbx_cache_clr,
+	output     [15:0] a4091_mbx_status,
+	output     [63:0] a4091_dbg_bus
 );
+
+// A4091 only on the 32-bit TG68 CPU (Zorro III needs a 32-bit bus)
+wire a4091_on = a4091_ena & cpucfg[1];
+
+// forward declarations (the a4091 instance is at the bottom of the module)
+wire [3:0]  a4091_ac_rdata;
+wire [7:0]  a4091_board_base;
+wire        a4091_cfgd;
+wire [15:0] a4091_brd_dout;
+wire        a4091_brd_selack;
+wire        a4091_brd_ready;
 
 wire dcache_sw_en_p;
 assign dcache_sw_en = cpucfg[1] ? dcache_sw_en_p : 1'b1;
@@ -156,6 +192,7 @@ assign fastchip_rnw = wr;
 reg  [31:0] cpu_addr;
 reg  [15:0] cpu_dout;
 wire [15:0] cpu_din = ramsel ? ramdat :
+                      a4091_brd_selack ? a4091_brd_dout :
                       fastchip_selack ? fastchip_dout :
                       cdtv_selack ? cdtv_din :
                       {sel_autoconfig ? autocfg_data : chip_data[15:12], chip_data[11:0]};
@@ -324,7 +361,7 @@ always @(posedge clk) begin
 end
 
 wire stock_speed   = cachecfg[3];
-wire clkena_p_base = ~cpu_req | chipready | ramready | fastchip_ready;
+wire clkena_p_base = ~cpu_req | chipready | ramready | fastchip_ready | a4091_brd_ready;
 
 reg [3:0] cooldown;
 always @(posedge clk) begin
@@ -337,7 +374,7 @@ wire clkena_p_throttled = clkena_p_base & (cooldown == 4'd0);
 reg       chipreq;
 reg [2:0] cpu_ipl;
 always @(posedge clk) begin
-	chipreq <= cpu_req & ~ramsel & ~fastchip_selack;
+	chipreq <= cpu_req & ~ramsel & ~fastchip_selack & ~a4091_brd_selack;
 	cpu_ipl <= ipl_i;
 end
 
@@ -501,6 +538,29 @@ always @(*) begin
 			default: ;
 		endcase
 	end
+	// Zorro III RAM 128MB/256MB/384MB
+	else if(ac_memcard[2]) begin
+		case (chip_addr[6:1])
+			6'b000000: autocfg_data = 4'b1010;	// Zorro-III card, add mem, no ROM
+			6'b000001: autocfg_data = ac_memcard[1] ? 4'b0011 : 4'b0100; // 128MB or 256MB, extended
+			6'b000010: autocfg_data = 4'b1110;	// ProductID=0x10 (only setting upper nibble)
+			6'b000100: autocfg_data = 4'b0000;	// Memory card, not silenceable, Extended size, reserved.
+			6'b000101: autocfg_data = 4'b1111;	// 0000 - logical size matches physical size TODO change this to 0001, so it is autosized by the OS, WHEN it will be 24MB.
+			6'b001000: autocfg_data = 4'b1110;	// Manufacturer ID: 0x139c
+			6'b001001: autocfg_data = 4'b1100;
+			6'b001010: autocfg_data = 4'b0110;
+			6'b001011: autocfg_data = 4'b0011;
+			6'b010011: autocfg_data = {2'b11, ~ac_memcard[1], ac_memcard[1]};	// serial=1/2
+			  default:;
+		endcase
+	end
+	// NOTE: the RTG board is deliberately assigned AFTER the Zorro III RAM
+	// board. AmigaOS hands out Z3 space in chain order, and the A4091's
+	// HPS-side DMA seam (minimig_a4091.cpp: phys = 0x30000000 + (A -
+	// 0x40000000)) assumes the Z3 fast RAM starts at $40000000. With RTG
+	// first, the RAM moved to $50000000, every driver buffer address fell
+	// outside the ARM's window, and a4091.device found no units.
+	// RTG itself does not care about its base (dynamic base compare).
 	// RTG combined board (Zorro III, mfr=0x139c product=0x30 -- "Rok Krajnc
 	// Minimig Z3 GraphicsCard"). Single AutoConfig'd 128MB window holding
 	// BOTH the 8MB framebuffer (board offset 0-$7FFFFF, DDR3-backed, see
@@ -535,25 +595,18 @@ always @(*) begin
 			  default:;
 		endcase
 	end
-	// Zorro III RAM 128MB/256MB/384MB
-	else if(ac_memcard[2]) begin
-		case (chip_addr[6:1])
-			6'b000000: autocfg_data = 4'b1010;	// Zorro-III card, add mem, no ROM
-			6'b000001: autocfg_data = ac_memcard[1] ? 4'b0011 : 4'b0100; // 128MB or 256MB, extended
-			6'b000010: autocfg_data = 4'b1110;	// ProductID=0x10 (only setting upper nibble)
-			6'b000100: autocfg_data = 4'b0000;	// Memory card, not silenceable, Extended size, reserved.
-			6'b000101: autocfg_data = 4'b1111;	// 0000 - logical size matches physical size TODO change this to 0001, so it is autosized by the OS, WHEN it will be 24MB.
-			6'b001000: autocfg_data = 4'b1110;	// Manufacturer ID: 0x139c
-			6'b001001: autocfg_data = 4'b1100;
-			6'b001010: autocfg_data = 4'b0110;
-			6'b001011: autocfg_data = 4'b0011;
-			6'b010011: autocfg_data = {2'b11, ~ac_memcard[1], ac_memcard[1]};	// serial=1/2
-			  default:;
-		endcase
+	// A4091 - last board in the chain (after CDTV / RAM / Toccata / A2065 / RTG)
+	else if (ac_a4091_turn) begin
+		autocfg_data = a4091_ac_rdata;
 	end
 end
 
-wire sel_autoconfig = (chip_addr[23:16] == 8'b11101000) && (ac_memcard || ac_toccata || ac_a2065 || ac_rtg || ac_cdtv); //$E80000 - $E8FFFF
+// A4091 gets the $E8xxxx bus only once every other board has configured or
+// shut up. a4091.v drives its own nibbles and latches its own base register.
+wire ac_a4091_turn = a4091_on & ~a4091_cfgd
+                   & ~|ac_memcard & ~ac_toccata & ~ac_a2065 & ~ac_rtg & ~ac_cdtv;
+
+wire sel_autoconfig = (chip_addr[23:16] == 8'b11101000) && (ac_memcard || ac_toccata || ac_a2065 || ac_rtg || ac_cdtv || ac_a4091_turn); //$E80000 - $E8FFFF
 
 always @(posedge clk) begin
 	reg old_uds;
@@ -601,13 +654,6 @@ always @(posedge clk) begin
 				ac_a2065<=0;
 			end
 		end
-		else if(ac_rtg) begin
-			if (chip_addr[6:1] == 6'b100010) begin // Register 0x44, assign base address to RTG's Zorro III window (128MB granularity, same as z3ram_base0 below)
-				rtg_z3_base <= cpu_dout[15:11];
-				rtg_z3_ena  <= 1;
-				ac_rtg      <= 0;
-			end
-		end
 		else if(ac_memcard[2]) begin
 			if(chip_addr[6:1] == 6'b100010) begin // Register 0x44, assign base address to ZIII RAM.
 				if(~ac_memcard[1]) begin
@@ -622,6 +668,13 @@ always @(posedge clk) begin
 				end
 			end
 		end
+		else if(ac_rtg) begin
+			if (chip_addr[6:1] == 6'b100010) begin // Register 0x44, assign base address to RTG's Zorro III window (128MB granularity, same as z3ram_base0 below)
+				rtg_z3_base <= cpu_dout[15:11];
+				rtg_z3_ena  <= 1;
+				ac_rtg      <= 0;
+			end
+		end
 	end
 end
 
@@ -633,5 +686,74 @@ assign a2065_ena   = ~ac_a2065;
 // captured AutoConfig register.
 assign rtg_ena  = rtg_z3_ena;
 assign rtg_base = 8'h80;
+
+///////////////////// A4091 (Zorro III NCR 53C710 SCSI) ////////////////////
+
+reg old_uds_g;
+always @(posedge clk) old_uds_g <= chip_uds;
+
+// 16MB board window at the AutoConfig'd Zorro III base (boot ROM 0..$7FFFFF,
+// 53C710 register window at +$800000, DIP byte at +$8C0003).
+wire sel_a4091 = a4091_cfgd & cpu_req & (cpu_addr_p[31:24] == a4091_board_base);
+
+a4091 a4091_inst
+(
+	.clk        (clk),
+	.reset      (~reset | ~reset_out),
+
+	.enable     (a4091_on),
+	.cfg_scsi_id (a4091_scsi_id),
+	.cfg_dip     (a4091_dip),
+
+	.ac_cycle   (sel_autoconfig & ac_a4091_turn),
+	.ac_reg     (chip_addr[6:1]),
+	.ac_write   (sel_autoconfig & ac_a4091_turn & ~chip_rw & ~chip_uds & old_uds_g),
+	.ac_wdata   (cpu_dout),
+	.ac_rdata   (a4091_ac_rdata),
+	.ac_done    (),
+
+	.board_base (a4091_board_base),
+	.board_cfgd (a4091_cfgd),
+	.brd_sel    (sel_a4091),
+	.brd_addr   (cpu_addr_p[23:0]),
+	.brd_din    (cpu_dout_p),
+	.brd_dout   (a4091_brd_dout),
+	.brd_lds    (~lds_p),
+	.brd_uds    (~uds_p),
+	.brd_rnw    (wr_p),
+	.brd_selack (a4091_brd_selack),
+	.brd_ready  (a4091_brd_ready),
+
+	// no FPGA bus-master DMA in the software-SIOP design
+	.dma_req    (),
+	.dma_rw     (),
+	.dma_addr   (),
+	.dma_wdata  (),
+	.dma_rdata  (16'd0),
+	.dma_bs     (),
+	.dma_ack    (1'b0),
+
+	.int2       (a4091_int2),
+
+	.rom_wr     (a4091_rom_wr),
+	.rom_addr   (a4091_rom_addr),
+	.rom_data   (a4091_rom_data),
+
+	.mbx_addr     (a4091_mbx_addr),
+	.mbx_regs_wr  (a4091_mbx_regs_wr),
+	.mbx_wdata    (a4091_mbx_wdata),
+	.mbx_rdata    (a4091_mbx_rdata),
+	.mbx_set_int  (a4091_mbx_set_int),
+	.mbx_clr_int  (a4091_mbx_clr_int),
+	.mbx_clr_kick (a4091_mbx_clr_kick),
+	.mbx_clr_srst (a4091_mbx_clr_srst),
+	.mbx_cache_clr(a4091_mbx_cache_clr),
+	.cache_clr    (a4091_cache_clr),
+	.mbx_status   (a4091_mbx_status),
+
+	.dbg_bus    (a4091_dbg_bus),
+
+	.led        ()
+);
 
 endmodule

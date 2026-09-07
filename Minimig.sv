@@ -146,6 +146,22 @@ wire        arb_chip_rw;
 wire        arb_chip_dma;
 wire [15:0] arb_chip_wr;
 
+// ---- A4091 software-SIOP bridge mailbox (hps_ext <-> cpu_wrapper/a4091) ----
+// The 53C710 model + SCRIPTS VM + SCSI-2 emulation run on the HPS ARM
+// (a4091_hps_thread, support/minimig/minimig_a4091.cpp). The FPGA side is a
+// 256-byte shadow register RAM plus a kick flag and an IRQ line
+// (rtl/a4091/a4091_bridge.v) - no sector server, no FPGA DMA master: the ARM
+// moves DATA phases straight into HPS DDR (Z3 fast RAM is physically DDR).
+wire  [7:0] a4091_mbx_addr;
+wire        a4091_mbx_regs_wr;
+wire  [7:0] a4091_mbx_wdata;
+wire  [7:0] a4091_mbx_rdata;
+wire        a4091_mbx_set_int, a4091_mbx_clr_int, a4091_mbx_clr_kick, a4091_mbx_clr_srst;
+wire        a4091_mbx_cache_clr;
+wire        a4091_cache_clr;
+wire [15:0] a4091_mbx_status;
+wire [63:0] a4091_dbg_bus;
+
 wire [35:0] EXT_BUS;
 hps_ext hps_ext(.*, .ide_req(ide_fast ? ide_f_req : ide_c_req),  .ide_din(ide_fast ? ide_f_readdata : ide_c_readdata));
 
@@ -299,6 +315,12 @@ end
 wire  [1:0] cpu_state;
 wire        cpu_nrst_out;
 wire  [3:0] cpu_cacr;
+// The RAM controllers' read caches cannot snoop the ARM's mmap writes into
+// HPS DDR, so a4091_bridge pulses cpu_cache_new's clear (the 68020 CACR
+// clear bit) after a DATA-IN. Registered on clk_sys: a combinational OR here
+// failed clk_114 timing (JOURNAL 20260906-16xx, build 1).
+reg   [3:0] cpu_cacr_a4091;
+always @(posedge clk_sys) cpu_cacr_a4091 <= cpu_cacr | {a4091_cache_clr, 3'b000};
 wire [31:0] cpu_nmi_addr;
 wire        cpu_rst;
 
@@ -341,6 +363,14 @@ wire        cdtv_dma_we;
 wire [31:0] cdtv_dma_baddr;
 wire  [7:0] cdtv_dma_wbyte;
 wire        cdtv_dma_ack;
+
+// A4091 Zorro III NCR 53C710 SCSI - SOFTWARE SIOP (see A4091/software-siop-*).
+// FPGA side = autoconfig + boot ROM + register window + the a4091_bridge
+// shadow-register RAM / kick / IRQ. The 53C710 model, SCRIPTS VM and SCSI-2
+// emulation (up to 6 targets, IDs 1..6, each an .hdf from the OSD "A4091 SCSI"
+// section) run on the HPS ARM. O[57] gates autoconfig.
+wire        a4091_ena = status[57];
+wire        a4091_int2;
 
 cpu_wrapper cpu_wrapper
 (
@@ -406,7 +436,28 @@ cpu_wrapper cpu_wrapper
 	.z3ram_ena0   (z3ram_ena0      ),
 	.z3ram_base1  (z3ram_base1     ),
 	.z3ram_ena1   (z3ram_ena1      ),
-	.dcache_sw_en (dcache_sw_en    )
+	.dcache_sw_en (dcache_sw_en    ),
+
+	// A4091 SCSI - software SIOP bridge
+	.a4091_ena     (a4091_ena       ),
+	.a4091_scsi_id (3'd7            ),
+	.a4091_dip     (5'b00000        ),
+	.a4091_int2    (a4091_int2      ),
+	.a4091_rom_wr  (1'b0            ),   // ROM preloaded from rtl/a4091/a4091_rom.mif
+	.a4091_rom_addr(16'd0           ),
+	.a4091_rom_data(8'd0            ),
+	.a4091_mbx_addr    (a4091_mbx_addr    ),
+	.a4091_mbx_regs_wr (a4091_mbx_regs_wr ),
+	.a4091_mbx_wdata   (a4091_mbx_wdata   ),
+	.a4091_mbx_rdata   (a4091_mbx_rdata   ),
+	.a4091_mbx_set_int (a4091_mbx_set_int ),
+	.a4091_mbx_clr_int (a4091_mbx_clr_int ),
+	.a4091_mbx_clr_kick(a4091_mbx_clr_kick),
+	.a4091_mbx_clr_srst(a4091_mbx_clr_srst),
+	.a4091_mbx_cache_clr(a4091_mbx_cache_clr),
+	.a4091_cache_clr   (a4091_cache_clr   ),
+	.a4091_mbx_status  (a4091_mbx_status  ),
+	.a4091_dbg_bus     (a4091_dbg_bus     )
 );
 
 wire        dcache_sw_en;
@@ -436,7 +487,7 @@ sdram_ctrl ram1
 	.c_7m         (c1              ),
 
 	.cache_rst    (cpu_rst         ),
-	.cpu_cache_ctrl(cpu_cacr       ),
+	.cpu_cache_ctrl(cpu_cacr_a4091 ),
 	.dcache_sw_en (dcache_sw_en    ),
 
 	.sd_data      (SDRAM_DQ        ),
@@ -530,7 +581,7 @@ ddram_ctrl ram2
 	.reset_n      (~reset_d        ),
 
 	.cache_rst    (cpu_rst         ),
-	.cpu_cache_ctrl(cpu_cacr       ),
+	.cpu_cache_ctrl(cpu_cacr_a4091 ),
 	.dcache_sw_en (dcache_sw_en    ),
 
 	.DDRAM_CLK    (DDRAM_CLK       ),
@@ -884,7 +935,9 @@ minimig minimig
 	.a2065_mem_writedata(a2065_mem_writedata),
 	.a2065_mem_byteenable(a2065_mem_byteenable),
 	.a2065_mem_write(a2065_mem_write),
-	.a2065_mem_waitrequest(a2065_mem_waitrequest)
+	.a2065_mem_waitrequest(a2065_mem_waitrequest),
+
+	.a4091_int2   (a4091_int2       )
 );
 
 // power led control
