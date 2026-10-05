@@ -15,9 +15,12 @@ images on the MiSTer's storage.
 > the range of a real A4091 in an A4000.
 >
 > **Not yet upstream.** The core integration in [`core/combined/`](core/combined/)
-> is a patch against a development branch that also carries a Zorro III RTG
-> board. Porting it onto current upstream `Minimig-AGA_MiSTer` / `Main_MiSTer`
-> is the next step. See [Roadmap](#roadmap).
+> is a patch against `rtg-z3-graphics-card`, a development branch of
+> Minimig-AGA_MiSTer that adds a Zorro III RTG graphics board (see
+> [The RTG branch](#the-rtg-branch-zorro-iii-graphics-card)). The tested core
+> therefore carries three boards: A4091 + Z3 RTG + A2065. Porting the A4091
+> alone onto current upstream `Minimig-AGA_MiSTer` / `Main_MiSTer` is the
+> next step. See [Roadmap](#roadmap).
 
 ## How it works: a "software SIOP"
 
@@ -99,6 +102,64 @@ Prebuilt Amiga binaries are attached to the
 | `devtest`, `ncr7xx`, `a4091d`, `A4091.guide` | anywhere | a4091-software tools and manual |
 | `a4091dbg`, `peek`, `scsi_fmt` | anywhere | this project's diagnostics, with sources in `tools/` |
 
+## The RTG branch (Zorro III graphics card)
+
+The only integration tested on hardware so far,
+[`core/combined/a4091-on-rtgz3.patch`](core/combined/a4091-on-rtgz3.patch),
+applies to **`rtg-z3-graphics-card`**, not to upstream. That branch is a
+separate piece of work on Minimig-AGA_MiSTer. It gives the core's existing RTG
+framebuffer a real Zorro AutoConfig identity.
+
+**Why it exists.** Upstream's RTG decodes at fixed addresses, and the P96 driver
+finds it without AutoConfig. That leaves the OS with no `ConfigDev` for the
+board. Without one, a 68030/040 PMMU cannot build correct page descriptors for
+the framebuffer. The branch makes the board a genuine, dynamically placed
+Zorro III device.
+
+**Base and commits.** It sits on upstream `b265a3b` (Release 20260823), which
+already includes the A2065:
+
+| Commit | Change |
+|---|---|
+| `13ed7a8` | RTG as two real Zorro II AutoConfig boards: regs+CLUT, and the framebuffer at `$200000` |
+| `4308734` | Fix the framebuffer physical-offset math for a real `cd_BoardAddr`. The pass-through decode had rotated the 8 MB window by +2 MB, so the CPU and the ARM video scanout disagreed about where offset 0 was |
+| `02eff9c` | Replace both with **one Zorro III board**, current state |
+
+**The board** (`02eff9c`):
+
+| | |
+|---|---|
+| Ident | mfr `0x139C`, product `0x30`, "Rok Krajnc Minimig Z3 GraphicsCard", 16 MB |
+| Board offset `0`–`$7FFFFF` | 8 MB framebuffer in DDR3, decoded in `memory_router.v` (`sel_rtg`). Like the Z3 FastRAM board, it uses a 128 MB-granularity base compare |
+| Board offset `$800000`–`$80FFFF` | 64 KB regs + CLUT. This is upstream's `fastchip.v` `rtg` block, reached by widening `cpu_wrapper.v`'s `fastchip_sel` |
+| Files touched | `rtl/cpu_wrapper.v` (`ac_rtg` chain link), `rtl/memory_router.v`, `rtl/chipdma_arb.v`, `rtl/fastchip.v`, `rtl/gary.v`, `extra/rtg_driver/MiSTer.card.asm` |
+| Amiga driver | The Zorro III `MiSTer.card` does `FindConfigDev(0x139C, 0x30)`. The stock card from the Minimig archive will **not** find this board |
+
+On hardware the RTG-only build shows the board in `showconfig`. The test
+pattern, P96 800×600×8 and the mouse pointer all work. In the combined core,
+the RTG registers and framebuffer read back byte-exact. Nobody has yet watched
+the monitor switch to the RTG framebuffer there (`core/combined/RESULTS.md`).
+
+**Interaction with the A4091: AutoConfig order matters.** The branch puts the
+RTG board *before* the Z3 FastRAM board in the chain. That pushes FastRAM from
+`$40000000` to `$50000000`. The A4091's ARM side hardcodes the FastRAM base,
+so every DMA buffer then falls outside its window. The board still enumerates,
+but the SCSI probe finds nothing. The combined patch therefore moves `ac_rtg`
+after `ac_memcard[2]`. The resulting chain is CDTV → Z2 RAM → Toccata → A2065
+→ Z3 RAM → RTG → A4091. Two more things to know:
+
+* RTG decodes on a 128 MB base, split by `cpu_addr[26:23]`. A board placed in
+  the same 128 MB block at `[26:23] == 1` would collide with the regs window.
+  AmigaOS's board-size alignment avoids this today.
+* The A4091 is safe only as the last link, because of its 8 MB declared /
+  16 MB decoded quirk.
+
+**Availability.** `rtg-z3-graphics-card` is not on GitHub yet. Until it is
+published (planned for the `georgemog/Minimig-AGA_MiSTer` fork) or merged
+upstream, `core/combined/` documents a build that others cannot reproduce. The
+upstream A4091 port in the [Roadmap](#roadmap) has no RTG dependency at all.
+Upstream has no `ac_rtg`, so the A4091 just follows the Z3 RAM board.
+
 ## Known limitations
 
 * **Z3 RAM base hardcoded.** `minimig_a4091.cpp` maps `$40000000` → HPS
@@ -125,6 +186,9 @@ Details and history: [`docs/ISSUES.md`](docs/ISSUES.md).
    path configurable.
 4. Upstream the driver tweaks to `a4091-software` as a build option, so the ROM
    builds from upstream.
+5. Publish `rtg-z3-graphics-card` so the combined A4091 + RTG + A2065 build in
+   `core/combined/` can be reproduced. Propose the Z3 RTG board upstream on its
+   own.
 
 ## Credits and licence
 
