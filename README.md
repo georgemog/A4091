@@ -21,6 +21,12 @@ images on the MiSTer's storage.
 > therefore carries three boards: A4091 + Z3 RTG + A2065. Porting the A4091
 > alone onto current upstream `Minimig-AGA_MiSTer` / `Main_MiSTer` is the
 > next step. See [Roadmap](#roadmap).
+>
+> **Ready-to-build core:** the full combined tree (A4091 + Z3 RTG + A2065,
+> validated on hardware) is on the
+> [`minimig-core`](https://github.com/georgemog/A4091/tree/minimig-core) branch.
+> The RTG-only tree is on
+> [`rtg-z3-graphics-card`](https://github.com/georgemog/A4091/tree/rtg-z3-graphics-card).
 
 ## How it works: a "software SIOP"
 
@@ -50,6 +56,16 @@ The FPGA is now a thin bridge with no bus master. The full story is in
 
 ## Repository layout
 
+Branches:
+
+| Branch | What |
+|---|---|
+| `main` | This project: docs, ARM-side code, ROM recipe, tools, patches |
+| [`minimig-core`](https://github.com/georgemog/A4091/tree/minimig-core) | Full Minimig-AGA_MiSTer tree with A4091 + Z3 RTG + A2065, ready for Quartus. It is upstream history through `b265a3b` (Release 20260823), then the 3 RTG commits, then the combined A4091 commit = `rtg-z3-graphics-card` + `core/combined/a4091-on-rtgz3.patch` + `rtl/` |
+| [`rtg-z3-graphics-card`](https://github.com/georgemog/A4091/tree/rtg-z3-graphics-card) | Only the Zorro III RTG board, on upstream `b265a3b` |
+
+On `main`:
+
 | Path | What |
 |---|---|
 | [`rtl/`](rtl/) | FPGA side: `a4091.v` (AutoConfig, board window, boot ROM, bridge instance), `a4091_bridge.v` (shadow regs, kick, IRQ, debug bus), `a4091_rom.mif` (boot ROM image for Quartus) |
@@ -68,8 +84,10 @@ The FPGA is now a thin bridge with no bus master. The full story is in
 `rom/make_hex.sh` to `rtl/a4091_rom.mif`. Full recipe:
 [`rom/driver-patches/README.md`](rom/driver-patches/README.md).
 
-**FPGA core.** Quartus 17.0 Lite. Apply the core patch and copy `rtl/*` to
-`rtl/a4091/`. Recipe and timing notes:
+**FPGA core.** Quartus 17.0 Lite. Easiest is to build the
+[`minimig-core`](https://github.com/georgemog/A4091/tree/minimig-core) branch
+as-is. Alternatively, apply the core patch to `rtg-z3-graphics-card` and copy
+`rtl/*` to `rtl/a4091/`. Recipe and timing notes:
 [`core/combined/README.md`](core/combined/README.md).
 
 **Main_MiSTer.** Copy `main_mister/*.{cpp,h}` into `support/minimig/` and
@@ -154,9 +172,12 @@ after `ac_memcard[2]`. The resulting chain is CDTV → Z2 RAM → Toccata → A2
 * The A4091 is safe only as the last link, because of its 8 MB declared /
   16 MB decoded quirk.
 
-**Availability.** `rtg-z3-graphics-card` is not on GitHub yet. Until it is
-published (planned for the `georgemog/Minimig-AGA_MiSTer` fork) or merged
-upstream, `core/combined/` documents a build that others cannot reproduce. The
+**Availability.** The branch is published here as
+[`rtg-z3-graphics-card`](https://github.com/georgemog/A4091/tree/rtg-z3-graphics-card).
+The combined result is
+[`minimig-core`](https://github.com/georgemog/A4091/tree/minimig-core). To build
+it, clone that branch and run `quartus_sh --flow compile Minimig` (Quartus 17.0
+Lite). The tree carries `SEED 1`. The
 upstream A4091 port in the [Roadmap](#roadmap) has no RTG dependency at all.
 Upstream has no `ac_rtg`, so the A4091 just follows the Z3 RAM board.
 
@@ -186,9 +207,7 @@ Details and history: [`docs/ISSUES.md`](docs/ISSUES.md).
    path configurable.
 4. Upstream the driver tweaks to `a4091-software` as a build option, so the ROM
    builds from upstream.
-5. Publish `rtg-z3-graphics-card` so the combined A4091 + RTG + A2065 build in
-   `core/combined/` can be reproduced. Propose the Z3 RTG board upstream on its
-   own.
+5. Propose the Z3 RTG board (`rtg-z3-graphics-card`) upstream on its own.
 
 ## Credits and licence
 
