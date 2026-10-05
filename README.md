@@ -1,3 +1,36 @@
+# Minimig-AGA_MiSTer — A4091 + Zorro III RTG + A2065 development tree
+
+> **This is not the official core.** This branch of [georgemog/A4091](https://github.com/georgemog/A4091)
+> holds a development tree of
+> [MiSTer-devel/Minimig-AGA_MiSTer](https://github.com/MiSTer-devel/Minimig-AGA_MiSTer)
+> carrying three expansion boards, all validated on real MiSTer hardware
+> (2026-09-07). Project documentation, the ARM-side code, tools and results are
+> on the repository's **[`main`](https://github.com/georgemog/A4091/tree/main)** branch.
+>
+> | Branch | Contents |
+> |---|---|
+> | `minimig-core` (this branch) | The combined core: A4091 SCSI + Z3 RTG + A2065 on Release 20260823 |
+> | `rtg-z3-graphics-card` | Only the Zorro III RTG board (3 commits on upstream `b265a3b`, Release 20260823) |
+>
+> **Boards in `a4091-rtg-a2065`:**
+> * **A4091**: Commodore Zorro III SCSI (NCR 53C710), mfr 514 / prod 84. It is
+>   enabled with OSD `O[57]` and needs the 68020 CPU setting. The 53C710 runs as
+>   a software SIOP in `Main_MiSTer`, so a `MiSTer` binary built with the patch
+>   from the A4091 repo is **required**. Without it the board enumerates but
+>   finds no drives. RTL is in `rtl/a4091/`.
+> * **Z3 RTG**: mfr `0x139C` / prod `0x30`, 16 MB, with the framebuffer at board
+>   offset 0 and the regs + CLUT at `+$800000`. It needs the Zorro III
+>   `MiSTer.card` from `extra/rtg_driver/MiSTer.card.asm`.
+> * **A2065** Ethernet: upstream, unchanged.
+>
+> AutoConfig order matters: CDTV → Z2 RAM → Toccata → A2065 → Z3 RAM → RTG →
+> A4091. Z3 FastRAM must stay at `$40000000` for the A4091's ARM side.
+>
+> **Build:** Quartus 17.0 Lite, `quartus_sh --flow compile Minimig`. The tree
+> carries `SEED 1`, which met clk_114 by +0.053 ns; seed 4 fails timing.
+
+---
+
 # Minimig-AGA_MiSTer
 
 This is a port of the minimig core to the [MiSTer board](https://github.com/MiSTer-devel).
