@@ -1,0 +1,72 @@
+--- user_io.cpp.pre_dbg	2026-09-02 14:45:07.990727647 +0100
++++ user_io.cpp	2026-09-02 14:45:07.998978234 +0100
+@@ -3176,6 +3176,53 @@
+ 	fflush(lf);
+ }
+ 
++/*
++ * DATA-phase hang capture. Reads the SIOP 64-bit debug bus (hps_ext cmd
++ * 0x68) and logs it whenever the compact state key changes, plus a
++ * heartbeat. Survives an Amiga wedge - this is HPS<->FPGA only.
++ *
++ * dbg_bus layout (a4091.v):
++ *   [5:0]=siop st  [6]=dma_req  [7]=idle
++ *   [15:8]=dstat   [18:16]=phase [23:19]=reason
++ *   [31:24]=dien   [39:32]=kicks [47:40]=sels [55:48]=pmms [63:56]=sel_id
++ */
++static void a4091_dbg_snapshot(uint32_t polls, uint16_t sd_st, uint32_t lba)
++{
++	EnableIO();
++	uint16_t w0 = spi_w(0x0068);   // [15:0]
++	uint16_t w1 = spi_w(0);        // [31:16]
++	uint16_t w2 = spi_w(0);        // [47:32]
++	uint16_t w3 = spi_w(0);        // [63:48]
++	DisableIO();
++
++	uint8_t  st     =  w0 & 0x3f;
++	uint8_t  dma_req = (w0 >> 6) & 1;
++	uint8_t  idle    = (w0 >> 7) & 1;
++	uint8_t  dstat   = (w0 >> 8) & 0xff;
++	uint8_t  phase   =  w1 & 7;
++	uint8_t  reason  = (w1 >> 3) & 0x1f;
++	uint8_t  dien    = (w1 >> 8) & 0xff;
++	uint8_t  kicks   =  w2 & 0xff;
++	uint8_t  sels    = (w2 >> 8) & 0xff;
++	uint8_t  pmms    =  w3 & 0xff;
++	uint8_t  selid   = (w3 >> 8) & 0xff;
++
++	static uint32_t last_key = 0xffffffff;
++	static uint32_t last_hb  = 0;
++	uint32_t key = st | (phase << 6) | (dstat << 9) | (reason << 17)
++	             | (dma_req << 22) | (idle << 23) | ((sd_st & 0xff) << 24);
++
++	if (key != last_key || (polls - last_hb) >= 0x4000)
++	{
++		last_key = key;
++		last_hb  = polls;
++		a4log("DBG p=%u siop_st=%u ph=%u idle=%u dreq=%u dstat=%02x rsn=%02x "
++		      "dien=%02x kick=%u sel=%u pmm=%u selid=%02x | sd=%04x lba=%u\n",
++		      polls, st, phase, idle, dma_req, dstat, reason,
++		      dien, kicks, sels, pmms, selid, sd_st, lba);
++	}
++}
++
+ static void a4091_sd_poll()
+ {
+ 	// The core's a4091_sd latches img_present / disk_blocks on the
+@@ -3235,6 +3282,7 @@
+ 	// ---- hps_ext sector mailbox: served EVERY poll, drained in a loop while
+ 	//      a request is pending. One 512 B block per iteration. 0x64 poll /
+ 	//      0x65 HPS->FPGA / 0x66 FPGA->HPS / 0x67 block done.
++	a4091_dbg_snapshot(polls, 0, 0);
+ 	for (int guard = 0; guard < 4096; guard++)
+ 	{
+ 		EnableIO();
+@@ -3249,6 +3297,7 @@
+ 		uint32_t lba     = l0 | ((uint32_t)l1 << 16);
+ 		reqs++;
+ 		mount_confirmed = 1;                    // core is live - stop re-strobing
++		a4091_dbg_snapshot(polls, st, lba);
+ 		uint64_t nblk    = f->size >> 9;
+ 		int      is_wr   = (st & 2) ? 1 : 0;
+ 		int      inrange = (f->size && lba < nblk);

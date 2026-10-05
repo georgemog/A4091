@@ -1,0 +1,160 @@
+diff --git a/sd.c b/sd.c
+index 4703114..f8090c8 100644
+--- a/sd.c
++++ b/sd.c
+@@ -539,6 +539,23 @@ sd_readwrite(void *periph_p, uint64_t blkno, uint b_flags, void *buf,
+     struct scsipi_xfer *xs;
+     uint32_t blkshift = periph->periph_blkshift;
+     uint32_t nblks = buflen >> blkshift;
++
++    /*
++     * a4091_target's dbuf is 16 KB (BUFAW 14). The transfer protocol is
++     * strictly sequential - a4091_sd fills dbuf, then the SIOP drains it -
++     * so any transfer larger than dbuf wraps the fill pointer and desyncs
++     * the sec_done handshake: phase mismatch -> bus reset -> HDToolBox
++     * "I/O error code 48". Cap every transfer at 16 KB here; the
++     * sd_complete / chan_continue_iotd path re-issues the remainder.
++     *
++     * (A concurrent producer/consumer ring that would remove this cap was
++     * tried and reverted - see A4091/JOURNAL.md 20260904.)
++     */
++#define MM_MAX_XFER 16384u
++    if (buflen > MM_MAX_XFER) {
++        buflen = MM_MAX_XFER & ~((1u << blkshift) - 1u);
++        nblks  = buflen >> blkshift;
++    }
+     int cmdlen;
+     int flags;
+ 
+@@ -593,6 +610,11 @@ sd_readwrite(void *periph_p, uint64_t blkno, uint b_flags, void *buf,
+     else
+         flags |= XS_CTL_DATA_OUT;
+ 
++    {
++        struct scsipi_channel *chan = periph->periph_channel;
++        if (((struct IOExtTD *)ior)->iotd_Req.io_Actual == 0)
++            chan->chan_current_blkno = blkno;
++    }
+     xs = scsipi_make_xs_locked(periph, &cmdbuf, cmdlen, buf, buflen,
+                                SDRETRIES, SD_IO_TIMEOUT, NULL, flags);
+     if (__predict_false(xs == NULL))
+@@ -1043,6 +1065,13 @@ conv_sectors_to_chs(ULONG total, ULONG *c_p, ULONG *h_p, ULONG *s_p)
+ static void
+ geom_done_get_capacity(struct scsipi_xfer *xs)
+ {
++    {
++        struct DriveGeometry *g = xs->xs_callback_arg;
++        printf("[DBG] RC10 done err=%d status=%02x resid=%ld buf=%08lx %08lx @%p data=%p dlen=%ld\n",
++               (int)xs->error, (int)xs->status, (long)xs->resid,
++               ((ULONG *)g)[0], ((ULONG *)g)[1], (void *)g,
++               xs->data, (long)xs->datalen);
++    }
+     if (xs->error == 0) {
+         /*
+          * Geometry struct was used as a holding buffer for TotalSectors
+@@ -1116,6 +1145,8 @@ geom_done_inquiry(struct scsipi_xfer *oxs)
+ 
+     cap_buf = &geom->dg_SectorSize;
+ 
++    printf("[DBG] geom_done_inquiry rc=%d inq.dev=%02x cap_buf=%p flags=%x\n",
++           rc, ((unsigned char *)inq)[0], cap_buf, flags);
+     xs = scsipi_make_xs_locked(periph,
+                                (struct scsipi_generic *) &cmd, cmd_len,
+                                (uint8_t *) cap_buf, cap_len,
+diff --git a/siop.c b/siop.c
+index f2083f7..ad250c6 100644
+--- a/siop.c
++++ b/siop.c
+@@ -480,6 +480,63 @@ siop_sched(struct siop_softc *sc)
+     siop_select(sc);
+ }
+ 
++
++#ifdef PORT_AMIGA
++/*
++ * Minimig / FPGA core coherency workaround.
++ *
++ * The Minimig-AGA RAM controller (cpu_cache_new) is a look-through read
++ * cache in FRONT of RAM and does NOT snoop the a4091 bus-master DMA port.
++ * After a DATA-IN transfer the CPU's cached copy of the DMA buffer is
++ * stale. There are two independent cache instances - one for chip RAM
++ * (sdram_ctrl) and one for fast RAM (ddram_ctrl) - so both must be
++ * thrashed. fx68k has no CPU cache, so CacheClearE / CachePostDMA cannot
++ * reach this.
++ *
++ * Walk a scratch arena larger than the cache in each of chip and fast RAM;
++ * a linear sweep with an 8-byte stride (one touch per line) evicts every
++ * set regardless of where the DMA buffer landed.
++ */
++#define MM_EVICT_SIZE 32768
++static unsigned char *mm_evict_fast;
++static unsigned char *mm_evict_chip;
++static volatile unsigned long mm_evict_sink;
++
++static void
++mm_ramctrl_cache_evict(void)
++{
++    volatile unsigned char *q;
++    unsigned long i, acc = 0;
++
++    /*
++     * TG68 "020" on this MiSTer core DOES forward the 68020 CACR clear bit
++     * to cpu_cache_new (cpu_cache_ctrl[3] -> cpu_cache_clear, an edge on the
++     * CACR clear bit wipes BOTH the chip (sdram_ctrl) and fast (ddram_ctrl)
++     * cache instances). CacheClearU() issues exactly that, so it is a single
++     * unconditional flush of every a4091-DMA-stale line - much more reliable
++     * than the scratch sweep, which needs the arena to land in the same bank
++     * as the DMA buffer and only converges after several passes.
++     */
++    CacheClearU();
++
++    /* Separate checks + no re-assign: at init() time (ROM mounter) there is
++     * no FAST RAM yet, so the FAST alloc fails - but the mounter reads into
++     * CHIP RAM then, and the CHIP arena still evicts those lines. Retry the
++     * FAST alloc on later calls once expansion has added the RAM board. */
++    if (mm_evict_chip == NULL)
++        mm_evict_chip = AllocMem(MM_EVICT_SIZE, MEMF_CHIP | MEMF_PUBLIC);
++    if (mm_evict_fast == NULL)
++        mm_evict_fast = AllocMem(MM_EVICT_SIZE, MEMF_FAST | MEMF_PUBLIC);
++    if ((q = mm_evict_chip) != NULL)
++        for (i = 0; i < MM_EVICT_SIZE; i += 8)
++            acc += q[i];
++    if ((q = mm_evict_fast) != NULL)
++        for (i = 0; i < MM_EVICT_SIZE; i += 8)
++            acc += q[i];
++    mm_evict_sink = acc;
++}
++#endif
++
+ void
+ siop_scsidone(struct siop_acb *acb, int stat)
+ {
+@@ -566,6 +623,8 @@ siop_scsidone(struct siop_acb *acb, int stat)
+      */
+     if (acb->iob_buf != NULL && acb->iob_len != 0) {
+         CachePostDMA(&acb->iob_buf, (LONG *)&acb->iob_len, 0);
++        if (xs->xs_control & XS_CTL_DATA_IN)
++            mm_ramctrl_cache_evict();
+     }
+ #endif
+ 
+@@ -1270,6 +1329,19 @@ siop_checkintr(struct siop_softc *sc, u_char istat, u_char dstat,
+     int dfifo, dbc, sstat1;
+     (void)istat;
+ 
++#ifdef PORT_AMIGA
++    /*
++     * STATUS and MSG IN are DMA'd into acb->stat[0] / acb->msg[0] by the
++     * SIOP, and the Minimig RAM controller's read cache does not snoop that
++     * DMA. siop_scsidone() flushes via mm_ramctrl_cache_evict(), but that
++     * runs AFTER this routine has already read acb->stat[0]/msg[0] - on a
++     * command with no DATA IN phase those bytes could still be a stale
++     * cache line (reading back 0xFF). CacheClearU() is a bare CACR poke
++     * (no allocation, ISR-safe) so it is cheap enough to do up front here.
++     */
++    CacheClearU();
++#endif
++
+     dfifo = rp->siop_dfifo;
+     dbc = rp->siop_dbc0;
+     sstat1 = rp->siop_sstat1;

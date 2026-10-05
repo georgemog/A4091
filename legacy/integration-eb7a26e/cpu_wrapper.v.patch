@@ -1,0 +1,272 @@
+--- a/cpu_wrapper.v	2026-09-06 16:49:43.345425536 +0100
++++ b/cpu_wrapper.v	2026-09-06 13:36:18.830687054 +0100
+@@ -65,17 +65,117 @@
+ 	output            ramlds,
+ 	output            ramuds,
+ 	output            ramshared,
++	output            ramcinhibit,
++	output            a4091_dmaCS,
++	output            a4091_dmaWE,
++	output            a4091_dmaU,
++	output            a4091_dmaL,
++	output     [28:1] a4091_dmaAddr,
++	output     [15:0] a4091_dmaWR,
++	input      [15:0] a4091_dmaRD,
++	input             a4091_dmaACK,
++	// a4091 DMA to chip / motherboard RAM -> sdram_ctrl's dma slot
++	output            a4091_sdmaCS,
++	output     [24:1] a4091_sdmaAddr,
++	input      [15:0] a4091_sdmaRD,
++	input             a4091_sdmaACK,
+ 
+ 	output            toccata_ena,
+ 	output reg  [7:0] toccata_base,
+ 
+ 	output reg  [1:0] cpustate,
+ 	output reg  [3:0] cacr,
+-	output reg [31:0] nmi_addr
++	output reg [31:0] nmi_addr,
++
++	// ---- A4091 Zorro III NCR 53C710 SCSI - software SIOP bridge (see A4091/)
++	input             a4091_ena,
++	input       [2:0] a4091_scsi_id,
++	input       [4:0] a4091_dip,
++	output            a4091_int2,
++	output            a4091_cache_clr,
++	input             a4091_rom_wr,
++	input      [15:0] a4091_rom_addr,
++	input       [7:0] a4091_rom_data,
++	// HPS bridge mailbox (hps_ext.v <-> a4091_bridge)
++	input       [7:0] a4091_mbx_addr,
++	input             a4091_mbx_regs_wr,
++	input       [7:0] a4091_mbx_wdata,
++	output      [7:0] a4091_mbx_rdata,
++	input             a4091_mbx_set_int,
++	input             a4091_mbx_clr_int,
++	input             a4091_mbx_clr_kick,
++	input             a4091_mbx_clr_srst,
++	input             a4091_mbx_cache_clr,
++	output     [15:0] a4091_mbx_status,
++	output     [63:0] a4091_dbg_bus
+ );
+ 
+-assign ramsel       = cpu_req & ~sel_nmi_vector & (sel_zram | sel_chipram | sel_kickram | sel_dd | sel_rtg);
++// A4091 only on the 32-bit TG68 CPU (Zorro III needs a 32-bit bus)
++wire a4091_on = a4091_ena & cpucfg[1];
++
++// forward declarations (a4091 instance is at the bottom of the module)
++wire [3:0]  a4091_ac_rdata;
++wire [7:0]  a4091_board_base;
++wire        a4091_cfgd;
++wire [15:0] a4091_brd_dout;
++wire        a4091_brd_selack;
++wire        a4091_brd_ready;
++wire        a4091_dma_req;
++wire        a4091_dma_rw;
++wire [31:1] a4091_dma_addr;
++wire [15:0] a4091_dma_wdata;
++wire  [1:0] a4091_dma_bs;
++// `a4091_dma_req` is one pulse per DMA byte beat; between the SIOP's
++// back-to-back beats it drops for a few cycles. `a4091_dma_tail` stretches
++// the "CPU off the RAM bus" window ~8 clk past each beat so a whole
++// multi-byte fetch is one uninterrupted session and the mux below does not
++// flap back to the frozen CPU's pending access mid-fetch (build #34).
++// Corruption of the *first* beat after a longer gap (SIOP waiting on a SCSI
++// phase) is handled in the SIOP d8 engine by a throwaway priming read -
++// the cpu_wrapper-side arm-delay / registered-go / ack-gate attempts
++// (builds #39-#41) all made timing or the fetch worse.
++reg  [3:0]  a4091_dma_tail;
++always @(posedge clk) begin
++	if (a4091_dma_req)         a4091_dma_tail <= 4'd8;
++	else if (|a4091_dma_tail)  a4091_dma_tail <= a4091_dma_tail - 1'b1;
++end
++wire        a4091_dma_active = a4091_dma_req | (|a4091_dma_tail);
++
++// a4091 DMA no longer masquerades as a CPU cpuCS access - it drives
++// ddram_ctrl's dedicated dma* port (see .a4091_dma* below). `ramsel` is
++// CPU-only again; the cpu_addr / cpustate mux still switches on a4091 DMA
++// so the Z3->DDR address decode (`ramaddr`) is computed for `a4091_dmaAddr`.
++assign ramsel       = (cpu_req & ~a4091_dma_active) & ~sel_nmi_vector & (sel_zram | sel_chipram | sel_kickram | sel_dd | sel_rtg);
+ assign ramshared    = sel_dd;
++// ramcinhibit stays 0. Two FPGA-side coherency fixes were tried and both
++// broke the core:
++//   - snoop the a4091 DMA writes into cpu_cache_new (builds #65/#66):
++//     green screen at boot, functional (not timing - #66 met +0.058ns).
++//   - ramcinhibit = a4091_ena, i.e. run all fast RAM uncached while O57 is
++//     on (build #67): magenta/garbage crash - cpu_cache_new's cache_inhibit
++//     path only blocks new allocations, it is not a safe sustained-bypass.
++// DMA/CPU coherency for the a4091 is handled driver-side instead: after a
++// DATA-IN DMA completes, a4091.device walks a scratch buffer to evict the
++// stale line from the RAM-controller read cache before reading the result.
++assign ramcinhibit  = 1'b0;
++
++// ---- a4091 DMA routing ---------------------------------------------------
++// Zorro-fast target -> ddram_ctrl's dma port (Z3 fast is in DDR).
++// Anything else (chip / motherboard RAM) -> sdram_ctrl's dma slot.
++// `cpu_addr` is muxed to the DMA address during a4091_dma_req, so the
++// sel_* decodes below already describe the DMA target.
++wire a4091_dma_zorro = a4091_dma_req &  sel_zram;
++wire a4091_dma_chip  = a4091_dma_req & ~sel_zram;
++
++assign a4091_dmaCS   = a4091_dma_zorro;            // edge-synced in ddram_ctrl
++assign a4091_dmaWE   = ~a4091_dma_rw;              // dma_rw: 1=read -> WE 0
++assign a4091_dmaAddr = ramaddr;                    // Z3->DDR mapped (28:1)
++assign a4091_dmaWR   = a4091_dma_wdata;
++assign a4091_dmaU    = uds_in;                     // active low (mux sets from bs)
++assign a4091_dmaL    = lds_in;
++
++assign a4091_sdmaCS   = a4091_dma_chip;            // edge-synced in sdram_ctrl
++assign a4091_sdmaAddr = ramaddr[24:1];             // raw Amiga addr (identity for chip)
+ 
+ // NMI
+ always @(posedge clk) nmi_addr <= vbr + 32'h7c;
+@@ -90,7 +190,7 @@
+ // don't sel_kickram when writing
+ wire sel_kickram   = !cpu_addr[31:24] && (&cpu_addr[23:19] || (cpu_addr[23:19] == 5'b11100)) && ckick && wr;	// $f8xxxx, e0xxxx
+ wire sel_kicklower = !cpu_addr[31:24] && (cpu_addr[23:18] == 6'b111110);
+-wire sel_chipram   = !cpu_addr[31:21] && cchip; 		             //$000000 - $1FFFFF
++wire sel_chipram   = !cpu_addr[31:21] && cchip; // a4091 DMA to chip RAM: not supported via the ddram dma port (DDR only)
+ 
+ // we route everything hrtmon related through cart.v (needs a couple of signals to
+ // decide what to do, would not be good style to replicate that here). 
+@@ -130,7 +230,7 @@
+ 
+ reg  [31:0] cpu_addr;
+ reg  [15:0] cpu_dout;
+-wire [15:0] cpu_din = ramsel ? ramdat : fastchip_selack ? fastchip_dout : {sel_autoconfig ? autocfg_data : chip_data[15:12], chip_data[11:0]};
++wire [15:0] cpu_din = ramsel ? ramdat : a4091_brd_selack ? a4091_brd_dout : fastchip_selack ? fastchip_dout : {sel_autoconfig ? autocfg_data : chip_data[15:12], chip_data[11:0]};
+ reg         wr;
+ reg         uds_in;
+ reg         lds_in;
+@@ -156,6 +256,24 @@
+ 		chip_din     = cpu_dout_p;
+ 		chip_data    = chipdout_i;
+ 		fastchip_sel = cpu_req & !cpu_addr_p[31:24];
++
++		// A4091 bus-master DMA steals the RAM port (CPU stalled below)
++		if (a4091_dma_req) begin
++			cpu_addr = {a4091_dma_addr, 1'b0};
++			cpu_dout = a4091_dma_wdata;
++			wr       = a4091_dma_rw;              // 1 = read
++			uds_in   = ~a4091_dma_bs[1];
++			lds_in   = ~a4091_dma_bs[0];
++			// DMA read = data read (cpustate 10). On a bare 68020 the data
++			// cache is off (cc_den=0), so cpu_cache_new takes the
++			// cache_inhibit / FILLW branch: a direct single DDR read, no line
++			// caching -> no line for the CPU's gap-time code execution to
++			// evict and no cold-refill race. (cpustate 00 = instruction
++			// fetch was tried in #30-#46: it caches lines, and CPU activity
++			// during a SCSI phase wait evicts the script's lines -> the
++			// refill's first word came back bit-shifted.) Writes stay 11.
++			cpustate = a4091_dma_rw ? 2'b10 : 2'b11;
++		end
+ 		fastchip_lw  = longword;
+ 	end
+ 	else begin
+@@ -204,7 +322,7 @@
+ (
+   .clk(clk),
+   .nreset(reset),
+-  .clkena_in(~cpu_req | chipready | ramready | fastchip_ready),
++  .clkena_in(~a4091_dma_active & (~cpu_req | chipready | ramready | fastchip_ready | a4091_brd_ready)),
+   .data_in(cpu_din),
+   .ipl(cpu_ipl),
+   .ipl_autovector(1),
+@@ -289,7 +407,7 @@
+ reg       chipreq;
+ reg [2:0] cpu_ipl;
+ always @(posedge clk) begin
+-	chipreq <= cpu_req & ~ramsel & ~fastchip_selack;
++	chipreq <= cpu_req & ~ramsel & ~fastchip_selack & ~a4091_brd_selack & ~a4091_dma_active;
+ 	cpu_ipl <= ipl_i;
+ end
+ 
+@@ -410,9 +528,15 @@
+ 			  default:;
+ 		endcase
+ 	end
++	// A4091 - last board in the chain (after RAM + Toccata)
++	else if (ac_a4091_turn) begin
++		autocfg_data = a4091_ac_rdata;
++	end
+ end
+ 
+-wire sel_autoconfig = (chip_addr[23:16] == 8'b11101000) && (ac_memcard || ac_toccata); //$E80000 - $E8FFFF
++wire ac_a4091_turn = a4091_on & ~a4091_cfgd & ~|ac_memcard & ~ac_toccata;
++
++wire sel_autoconfig = (chip_addr[23:16] == 8'b11101000) && (ac_memcard || ac_toccata || ac_a4091_turn); //$E80000 - $E8FFFF
+ 
+ reg       z2ram_ena;
+ reg [4:0] z3ram_base0;
+@@ -464,4 +588,71 @@
+ 
+ assign toccata_ena = ~ac_toccata;
+ 
++///////////////////// A4091 (Zorro III NCR 53C710 SCSI) ////////////////////
++
++reg old_uds_g;
++always @(posedge clk) old_uds_g <= chip_uds;
++
++wire sel_a4091 = a4091_cfgd & ~a4091_dma_active & cpu_req
++               & (cpu_addr_p[31:24] == a4091_board_base);
++
++a4091 a4091_inst
++(
++	.clk        (clk),
++	.reset      (~reset | ~reset_out),
++
++	.enable     (a4091_on),
++	.cfg_scsi_id (a4091_scsi_id),
++	.cfg_dip     (a4091_dip),
++
++	.ac_cycle   (sel_autoconfig & ac_a4091_turn),
++	.ac_reg     (chip_addr[6:1]),
++	.ac_write   (sel_autoconfig & ac_a4091_turn & ~chip_rw & ~chip_uds & old_uds_g),
++	.ac_wdata   (cpu_dout),
++	.ac_rdata   (a4091_ac_rdata),
++	.ac_done    (),
++
++	.board_base (a4091_board_base),
++	.board_cfgd (a4091_cfgd),
++	.brd_sel    (sel_a4091),
++	.brd_addr   (cpu_addr_p[23:0]),
++	.brd_din    (cpu_dout_p),
++	.brd_dout   (a4091_brd_dout),
++	.brd_lds    (~lds_p),
++	.brd_uds    (~uds_p),
++	.brd_rnw    (wr_p),
++	.brd_selack (a4091_brd_selack),
++	.brd_ready  (a4091_brd_ready),
++
++	.dma_req    (a4091_dma_req),
++	.dma_rw     (a4091_dma_rw),
++	.dma_addr   (a4091_dma_addr),
++	.dma_wdata  (a4091_dma_wdata),
++	.dma_rdata  (a4091_dma_chip ? a4091_sdmaRD : a4091_dmaRD),
++	.dma_bs     (a4091_dma_bs),
++	.dma_ack    (a4091_dmaACK | a4091_sdmaACK),
++
++	.int2       (a4091_int2),
++
++	.rom_wr     (a4091_rom_wr),
++	.rom_addr   (a4091_rom_addr),
++	.rom_data   (a4091_rom_data),
++
++	.mbx_addr     (a4091_mbx_addr),
++	.mbx_regs_wr  (a4091_mbx_regs_wr),
++	.mbx_wdata    (a4091_mbx_wdata),
++	.mbx_rdata    (a4091_mbx_rdata),
++	.mbx_set_int  (a4091_mbx_set_int),
++	.mbx_clr_int  (a4091_mbx_clr_int),
++	.mbx_clr_kick (a4091_mbx_clr_kick),
++	.mbx_clr_srst (a4091_mbx_clr_srst),
++	.mbx_cache_clr(a4091_mbx_cache_clr),
++	.cache_clr    (a4091_cache_clr),
++	.mbx_status   (a4091_mbx_status),
++
++	.dbg_bus    (a4091_dbg_bus),
++
++	.led        ()
++);
++
+ endmodule

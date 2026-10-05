@@ -1,0 +1,61 @@
+diff --git a/sd.c b/sd.c
+index 4703114..70c6b9f 100644
+--- a/sd.c
++++ b/sd.c
+@@ -539,6 +539,21 @@ sd_readwrite(void *periph_p, uint64_t blkno, uint b_flags, void *buf,
+     struct scsipi_xfer *xs;
+     uint32_t blkshift = periph->periph_blkshift;
+     uint32_t nblks = buflen >> blkshift;
++
++    /*
++     * Software-SIOP C1 target buffer grows on demand, so this is a
++     * throughput knob, not a correctness cap: fewer, larger SCSI
++     * commands amortise the per-DATA-IN mm_ramctrl_cache_evict() sweep.
++     * 128 KB verified: regression 10/10 + a 4x 3.3 MB LhA copy/CRC on a
++     * filling (fragmenting) disk, all clean. A contiguous buffer is 1-2
++     * S/G segments; the datain SCRIPTS have 9. sd_complete /
++     * chan_continue_iotd re-issues anything past MM_MAX_XFER.
++     */
++#define MM_MAX_XFER 131072u
++    if (buflen > MM_MAX_XFER) {
++        buflen = MM_MAX_XFER & ~((1u << blkshift) - 1u);
++        nblks  = buflen >> blkshift;
++    }
+     int cmdlen;
+     int flags;
+ 
+@@ -593,6 +608,11 @@ sd_readwrite(void *periph_p, uint64_t blkno, uint b_flags, void *buf,
+     else
+         flags |= XS_CTL_DATA_OUT;
+ 
++    {
++        struct scsipi_channel *chan = periph->periph_channel;
++        if (((struct IOExtTD *)ior)->iotd_Req.io_Actual == 0)
++            chan->chan_current_blkno = blkno;
++    }
+     xs = scsipi_make_xs_locked(periph, &cmdbuf, cmdlen, buf, buflen,
+                                SDRETRIES, SD_IO_TIMEOUT, NULL, flags);
+     if (__predict_false(xs == NULL))
+@@ -1043,6 +1063,13 @@ conv_sectors_to_chs(ULONG total, ULONG *c_p, ULONG *h_p, ULONG *s_p)
+ static void
+ geom_done_get_capacity(struct scsipi_xfer *xs)
+ {
++    {
++        struct DriveGeometry *g = xs->xs_callback_arg;
++        printf("[DBG] RC10 done err=%d status=%02x resid=%ld buf=%08lx %08lx @%p data=%p dlen=%ld\n",
++               (int)xs->error, (int)xs->status, (long)xs->resid,
++               ((ULONG *)g)[0], ((ULONG *)g)[1], (void *)g,
++               xs->data, (long)xs->datalen);
++    }
+     if (xs->error == 0) {
+         /*
+          * Geometry struct was used as a holding buffer for TotalSectors
+@@ -1116,6 +1143,8 @@ geom_done_inquiry(struct scsipi_xfer *oxs)
+ 
+     cap_buf = &geom->dg_SectorSize;
+ 
++    printf("[DBG] geom_done_inquiry rc=%d inq.dev=%02x cap_buf=%p flags=%x\n",
++           rc, ((unsigned char *)inq)[0], cap_buf, flags);
+     xs = scsipi_make_xs_locked(periph,
+                                (struct scsipi_generic *) &cmd, cmd_len,
+                                (uint8_t *) cap_buf, cap_len,

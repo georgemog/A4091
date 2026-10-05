@@ -1,0 +1,219 @@
+diff --git a/menu.cpp b/menu.cpp
+index a659031..c0ce356 100644
+--- a/menu.cpp
++++ b/menu.cpp
+@@ -65,6 +65,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ #include "support.h"
+ #include "bootcore.h"
+ #include "ide.h"
++#include "support/minimig/minimig_a4091.h"
+ #include "profiling.h"
+ #include "str_util.h"
+ #include "autofire.h"
+@@ -182,6 +183,7 @@ enum MENU
+ 	MENU_MINIMIG_DISK1,
+ 	MENU_MINIMIG_DISK2,
+ 	MENU_MINIMIG_HDFFILE_SELECTED,
++	MENU_MINIMIG_SCSIFILE_SELECTED,
+ 	MENU_MINIMIG_CD32FILE_SELECTED,
+ 	MENU_MINIMIG_CDTVFILE_SELECTED,
+ 	MENU_MINIMIG_CD32FILE_START,
+@@ -352,6 +354,7 @@ static char SelectedLabel[1024] = {};
+ 
+ static char Selected_F[16][1024] = {};
+ static char Selected_S[16][1024] = {};
++static char Selected_A4091[6][1024] = {};
+ static char Selected_tmp[1024] = {};
+ static char Selected_CD32[1024] = {};
+ static char Selected_CDTV[1024] = {};
+@@ -6620,7 +6623,7 @@ void HandleUI(void)
+ 			m = 0;
+ 			if (!menusub) firstmenu = 0;
+ 			adjvisible = 0;
+-			menumask = 0x4010;
++			menumask = 0x10;
+ 
+ 			MenuWrite(m++, "", 0, 0);
+ 
+@@ -6721,8 +6724,48 @@ void HandleUI(void)
+ 				}
+ 			}
+ 
++			// A4091 SCSI - Zorro III card, needs a 68020+. Inlined here (IDs
++			// 1..6 scroll with the IDE drives, no sub-page). menusub 14, then
++			// 15/16..25/26 for the six ID type/path pairs.
++			if (minimig_config.cpu & 2)
++			{
++				MenuWrite(m++);   // gap between the IDE drives and A4091 SCSI
++				int scsi_on = (minimig_config.scsi_cfg & 1) ? 1 : 0;
++				strcpy(s, " A4091 SCSI       : ");
++				strcat(s, scsi_on ? "Enabled" : "Disabled");
++				MenuWrite(m++, s, menusub == 14, 0);
++				menumask |= ((uint64_t)1 << 14);
++
++				if (scsi_on)
++				{
++					for (uint i = 0; i < 6; i++)
++					{
++						uint tsub = 15 + i * 2;
++						snprintf(s, sizeof(s), " \x1bID%u            : ", i + 1);
++						strcat(s, minimig_config.scsi[i].cfg ? "Fixed/HDD" : "Disabled");
++						MenuWrite(m++, s, menusub == tsub, 0);
++						menumask |= ((uint64_t)1 << tsub);
++
++						if (minimig_config.scsi[i].filename[0])
++						{
++							strcpy(s, "                                ");
++							char *path = HomeDir();
++							int len = strlen(path);
++							char *name = minimig_config.scsi[i].filename;
++							if (!strncasecmp(name, path, len)) name += len + 1;
++							strncpy(&s[3], name, 25);
++						}
++						else strcpy(s, "   ** not selected **");
++						enable = minimig_config.scsi[i].cfg ? 1 : 0;
++						if (enable) menumask |= ((uint64_t)1 << (tsub + 1));
++						MenuWrite(m++, s, menusub == (tsub + 1), enable == 0);
++					}
++				}
++			}
++
+ 			while (m - firstmenu < OsdGetSize() - 1) MenuWrite(m++);
+-			MenuWrite(m++, STD_BACK, menusub == 14, 0);
++			MenuWrite(m++, STD_BACK, menusub == 27, 0);
++			menumask |= ((uint64_t)1 << 27);
+ 
+ 			menustate = MENU_MINIMIG_DISK2;
+ 
+@@ -6837,7 +6880,42 @@ void HandleUI(void)
+ 					else if (recent_init(500)) menustate = MENU_RECENT1;
+ 				}
+ 			}
+-			else if (menusub == 14 && select) // return to previous menu
++			else if (menusub == 14) // A4091 SCSI enable/disable
++			{
++				if (select || minus || plus)
++				{
++					minimig_config.scsi_cfg ^= 1;
++					a4091_apply_config();
++					menustate = MENU_MINIMIG_DISK1;
++				}
++			}
++			else if (menusub >= 15 && menusub <= 26) // A4091 ID1..ID6 (type/path)
++			{
++				int idx = (menusub - 15) / 2;
++				if (menusub & 1) // odd = type line
++				{
++					if (select || minus || plus)
++					{
++						minimig_config.scsi[idx].cfg = minimig_config.scsi[idx].cfg ? 0 : 1;
++						a4091_apply_config();
++						menustate = MENU_MINIMIG_DISK1;
++					}
++				}
++				else if (select || recent) // even = path line
++				{
++					fs_Options = SCANO_DIR | SCANO_UMOUNT;
++					fs_MenuSelect = MENU_MINIMIG_SCSIFILE_SELECTED;
++					fs_MenuCancel = MENU_MINIMIG_DISK1;
++					strcpy(fs_pFileExt, "HDFVHDIMGDSK");
++					if (select)
++					{
++						if (!Selected_A4091[idx][0]) memcpy(Selected_A4091[idx], minimig_config.scsi[idx].filename, sizeof(Selected_A4091[idx]));
++						SelectFile(Selected_A4091[idx], fs_pFileExt, fs_Options, fs_MenuSelect, fs_MenuCancel, 503);
++					}
++					else if (recent_init(503)) menustate = MENU_RECENT1;
++				}
++			}
++			else if (menusub == 27 && select) // return to previous menu
+ 			{
+ 				firstmenu = 0;
+ 				menustate = MENU_MINIMIG_MAIN1;
+@@ -6857,6 +6935,23 @@ void HandleUI(void)
+ 		}
+ 		break;
+ 
++	case MENU_MINIMIG_SCSIFILE_SELECTED:
++		{
++			int idx = (menusub - 15) / 2;
++			if (idx < 0) idx = 0;
++			if (idx > 5) idx = 5;
++			memcpy(Selected_A4091[idx], selPath, sizeof(Selected_A4091[idx]));
++			recent_update(SelectedDir, selPath, SelectedLabel, 503);
++			uint len = strlen(selPath);
++			if (len > sizeof(minimig_config.scsi[idx].filename) - 1) len = sizeof(minimig_config.scsi[idx].filename) - 1;
++			if (len) memcpy(minimig_config.scsi[idx].filename, selPath, len);
++			minimig_config.scsi[idx].filename[len] = 0;
++			if (!minimig_config.scsi[idx].cfg) minimig_config.scsi[idx].cfg = 1;
++			a4091_apply_config();
++			menustate = MENU_MINIMIG_DISK1;
++		}
++		break;
++
+ 	case MENU_MINIMIG_HDFFILE_SELECTED:
+ 		{
+ 			memcpy(Selected_S[(menusub - 7) / 2], selPath, sizeof(Selected_S[(menusub - 2) / 2]));
+diff --git a/support/minimig/minimig_config.cpp b/support/minimig/minimig_config.cpp
+index 6743d59..e8869eb 100644
+--- a/support/minimig/minimig_config.cpp
++++ b/support/minimig/minimig_config.cpp
+@@ -18,6 +18,7 @@
+ #include "minimig_config.h"
+ #include "minimig_share.h"
+ #include "minimig_a2065.h"
++#include "minimig_a4091.h"
+ #include "akiko_cd32.h"
+ #include "cdtv_cd.h"
+ #include <unistd.h>
+@@ -448,6 +449,14 @@ static void ApplyConfiguration(char reloadkickstart)
+ 	minimig_cd_drive_open(0, minimig_config.cd32_drive.cfg ? minimig_config.cd32_drive.filename : "");
+ 	minimig_cd_drive_open(1, minimig_config.cdtv_drive.cfg ? minimig_config.cdtv_drive.filename : "");
+ 
++	printf("\nA4091 SCSI: %s.\n", (minimig_config.scsi_cfg & 1) ? "enabled" : "disabled");
++	if (minimig_config.scsi_cfg & 1)
++		for (int i = 0; i < 6; i++)
++			if (minimig_config.scsi[i].cfg)
++				printf("  ID %d: %s\n", i + 1,
++				       minimig_config.scsi[i].filename[0] ? minimig_config.scsi[i].filename : "(no image)");
++	a4091_apply_config();
++
+ 	minimig_ConfigMemory(memcfg);
+ 	minimig_ConfigCPU(minimig_config.cpu);
+ 
+diff --git a/support/minimig/minimig_config.h b/support/minimig/minimig_config.h
+index c9b1331..01bcca1 100644
+--- a/support/minimig/minimig_config.h
++++ b/support/minimig/minimig_config.h
+@@ -68,6 +68,12 @@ typedef struct
+ 	mm_hardfileTYPE cd32_drive;
+ 	mm_hardfileTYPE cdtv_drive;
+ 	uint8_t         a2065_mode;
++	// --- appended: A4091 SCSI (see support/minimig/minimig_a4091.*). Kept at
++	//     the end so an older .minimig config still loads (the loader
++	//     zero-fills a short tail). scsi[i] -> SCSI ID (i+1); .cfg 0=Disabled
++	//     1=Fixed/HDD (Removable/CD is future work).
++	uint8_t         scsi_cfg;          // bit0 = A4091 SCSI enabled
++	mm_hardfileTYPE scsi[6];
+ } mm_configTYPE;
+ 
+ extern mm_configTYPE minimig_config;
+diff --git a/user_io.cpp b/user_io.cpp
+index 511c7a4..669c8df 100644
+--- a/user_io.cpp
++++ b/user_io.cpp
+@@ -35,6 +35,7 @@
+ #include "ide.h"
+ #include "ide_cdrom.h"
+ #include "support/minimig/akiko_cd32.h"
++#include "support/minimig/minimig_a4091.h"
+ #include "support/minimig/cdtv_cd.h"
+ #ifdef PROFILING
+ #include "profiling.h"
+@@ -3209,6 +3210,7 @@ void user_io_poll()
+ 
+ 		minimig_share_poll();
+ 		a2065_poll();
++		a4091_sd_poll();
+ 	}
+ 
+ 	if (core_type == CORE_TYPE_8BIT && !is_menu())

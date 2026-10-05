@@ -1,0 +1,73 @@
+diff --git a/siop.c b/siop.c
+index f2083f7..c763419 100644
+--- a/siop.c
++++ b/siop.c
+@@ -480,6 +480,57 @@ siop_sched(struct siop_softc *sc)
+     siop_select(sc);
+ }
+ 
++
++#ifdef PORT_AMIGA
++/*
++ * Minimig / FPGA core coherency workaround.
++ *
++ * The Minimig-AGA RAM controller (cpu_cache_new) is a look-through read
++ * cache in FRONT of RAM and does NOT snoop the a4091 bus-master DMA port.
++ * After a DATA-IN transfer the CPU's cached copy of the DMA buffer is
++ * stale. There are two independent cache instances - one for chip RAM
++ * (sdram_ctrl) and one for fast RAM (ddram_ctrl). fx68k has no CPU cache,
++ * so CacheClearE / CachePostDMA cannot reach this.
++ *
++ * The DMA buffer is contiguous in ONE RAM type, so sweep only that one
++ * cache: a linear 8-byte-stride sweep of a scratch arena 2x the cache
++ * size evicts every set/way regardless of where the buffer landed.
++ */
++#ifdef MM_DRIVER_CACHE_EVICT
++#define MM_EVICT_SIZE 8192      /* cpu_cache_new = 4 KB 2-way; 2x guarantees evict */
++static unsigned char *mm_evict_fast;
++static unsigned char *mm_evict_chip;
++static volatile unsigned long mm_evict_sink;
++
++/*
++ * Flush the Minimig RAM-controller read cache for the DMA buffer's region
++ * only. The buffer is contiguous in one RAM type: chip (< 0x200000, via
++ * sdram_ctrl) or fast (via ddram_ctrl) - each has its own cpu_cache_new.
++ * "Slow"/motherboard RAM (0xC00000..0xD7FFFF) is served by sdram_ctrl too,
++ * so treat it as chip. Sweeping just one 8 KB arena instead of two 32 KB
++ * ones is the difference between ~11 ms and ~1.5 ms per DATA-IN command.
++ */
++static void
++mm_ramctrl_cache_evict(APTR buf)
++{
++    volatile unsigned char *q;
++    unsigned long i, acc = 0;
++    ULONG a = (ULONG)buf;
++    int chip = (a < 0x00200000UL) || (a >= 0x00C00000UL && a < 0x00D80000UL);
++
++    if (mm_evict_fast == NULL) {
++        mm_evict_fast = AllocMem(MM_EVICT_SIZE, MEMF_FAST | MEMF_PUBLIC);
++        mm_evict_chip = AllocMem(MM_EVICT_SIZE, MEMF_CHIP | MEMF_PUBLIC);
++    }
++    q = chip ? mm_evict_chip : mm_evict_fast;
++    if (q != NULL)
++        for (i = 0; i < MM_EVICT_SIZE; i += 8)
++            acc += q[i];
++    mm_evict_sink = acc;
++}
++#endif /* MM_DRIVER_CACHE_EVICT */
++#endif
++
+ void
+ siop_scsidone(struct siop_acb *acb, int stat)
+ {
+@@ -566,6 +617,10 @@ siop_scsidone(struct siop_acb *acb, int stat)
+      */
+     if (acb->iob_buf != NULL && acb->iob_len != 0) {
+         CachePostDMA(&acb->iob_buf, (LONG *)&acb->iob_len, 0);
++#ifdef MM_DRIVER_CACHE_EVICT   /* superseded by the FPGA cpu_cache_new flush (hps_ext 0x67 bit4) */
++        if (xs->xs_control & XS_CTL_DATA_IN)
++            mm_ramctrl_cache_evict(acb->iob_buf);
++#endif
+     }
+ #endif
+ 

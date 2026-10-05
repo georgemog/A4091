@@ -1,0 +1,124 @@
+--- user_io.cpp.pre_drain	2026-09-02 08:11:04.486232370 +0100
++++ user_io.cpp	2026-09-02 08:11:04.529632844 +0100
+@@ -3180,61 +3180,63 @@
+ {
+ 	// The core's a4091_sd latches img_present / disk_blocks on the
+ 	// img_mounted strobe. One mount at the first poll races the FPGA reset
+-	// that follows load_core and is lost -> present=0 -> every SCSI SELECT
+-	// times out. So open the file once, then re-strobe UIO_SET_SDSTAT on a
+-	// schedule for the first ~20 s until the core is definitely out of reset.
++	// after load_core and is lost. So mount once, then re-strobe on a
++	// schedule - BUT ONLY until the core has actually pulled a sector
++	// (mount_confirmed). Re-strobing mid-transfer resets the a4091_sd FSM
++	// and drops the in-flight request -> SIOP watchdog -> BUS RESET.
+ 	static uint32_t polls = 0;
+ 	static int      opened = 0;
+ 	static int      remounts = 0;
++	static int      mount_confirmed = 0;
++	static uint8_t  a4buf[512];
++	static uint32_t reqs = 0;
+ 	fileTYPE *f = &sd_image[A4091_SD_SLOT];
+ 
+ 	polls++;
+-	if (polls & 0x3f) return;   // throttle: run the body ~every 64th call
+ 
+-	if (!opened)
++	// ---- housekeeping: throttled, and only while the mount is unproven ----
++	if ((polls & 0x3f) == 0)
+ 	{
+-		opened = 1;
+-		a4log("slot %d  size=%llu  path=\"%s\"\n",
+-		      A4091_SD_SLOT, (unsigned long long)f->size,
+-		      f->size ? f->name : "(none)");
+-		if (!f->size)
++		if (!opened)
+ 		{
+-			static const char *cand[] = {
+-				"A4091/a4091test.hdf",
+-				"/media/fat/A4091/a4091test.hdf",
+-				"../usb0/games/Amiga/shared/a4091/a4091test.hdf", 0 };
+-			for (int i = 0; cand[i]; i++)
++			opened = 1;
++			a4log("slot %d  size=%llu  path=\"%s\"\n",
++			      A4091_SD_SLOT, (unsigned long long)f->size,
++			      f->size ? f->name : "(none)");
++			if (!f->size)
+ 			{
+-				int r = user_io_file_mount(cand[i], A4091_SD_SLOT);
+-				a4log("  try mount \"%s\" -> ret=%d size=%llu\n",
+-				      cand[i], r, (unsigned long long)f->size);
+-				if (f->size) break;
++				static const char *cand[] = {
++					"A4091/a4091test.hdf",
++					"/media/fat/A4091/a4091test.hdf",
++					"../usb0/games/Amiga/shared/a4091/a4091test.hdf", 0 };
++				for (int i = 0; cand[i]; i++)
++				{
++					int r = user_io_file_mount(cand[i], A4091_SD_SLOT);
++					a4log("  try mount \"%s\" -> ret=%d size=%llu\n",
++					      cand[i], r, (unsigned long long)f->size);
++					if (f->size) break;
++				}
+ 			}
+ 		}
+-	}
+ 
+-	// Re-issue the full mount notify (size then mount strobe) every ~2 s for
+-	// the first ~2 min. The core's a4091_sd only latches the strobe while it
+-	// is out of reset, which does not happen until AmigaOS has finished
+-	// booting - well after the one mount at startup.
+-	if (f->size && (polls & 0x3fff) == 0)
+-	{
+-		remounts++;
+-		EnableIO();
+-		spi8(UIO_SET_SDINFO);
+-		if (io_ver) { spi32_w(f->size); spi32_w(f->size >> 32); }
+-		else        { spi32_b(f->size); spi32_b(f->size >> 32); }
+-		DisableIO();
+-		spi_uio_cmd8(UIO_SET_SDSTAT, (1 << A4091_SD_SLOT) | 0x80);
+-		if (remounts <= 8 || (remounts & 63) == 0) a4log("  re-mount %d @ poll %u\n", remounts, polls);
++		if (f->size && !mount_confirmed && (polls & 0x3fff) == 0)
++		{
++			remounts++;
++			EnableIO();
++			spi8(UIO_SET_SDINFO);
++			if (io_ver) { spi32_w(f->size); spi32_w(f->size >> 32); }
++			else        { spi32_b(f->size); spi32_b(f->size >> 32); }
++			DisableIO();
++			spi_uio_cmd8(UIO_SET_SDSTAT, (1 << A4091_SD_SLOT) | 0x80);
++			if (remounts <= 8 || (remounts & 63) == 0) a4log("  re-mount %d @ poll %u\n", remounts, polls);
++		}
+ 	}
+ 
+-	// ---- hps_ext sector mailbox: 0x64 poll / 0x65 HPS->FPGA / 0x66 FPGA->HPS
+-	//      / 0x67 block done. Serve one 512 B block per poll from the .hdf.
++	// ---- hps_ext sector mailbox: served EVERY poll, drained in a loop while
++	//      a request is pending. One 512 B block per iteration. 0x64 poll /
++	//      0x65 HPS->FPGA / 0x66 FPGA->HPS / 0x67 block done.
++	for (int guard = 0; guard < 4096; guard++)
+ 	{
+-		static uint8_t  a4buf[512];
+-		static uint32_t reqs = 0;
+-
+ 		EnableIO();
+ 		// hps_ext presents the 0x64 status on the SAME word that carries the
+ 		// command (like UIO_DMA_SDIO / ide_check), NOT the next word.
+@@ -3242,14 +3244,15 @@
+ 		uint16_t l0  = spi_w(0);               // lba[15:0]
+ 		uint16_t l1  = spi_w(0);               // lba[31:16]
+ 		DisableIO();
+-		uint32_t lba = l0 | ((uint32_t)l1 << 16);
+-		if (!(st & 3)) return;
++		if (!(st & 3)) break;
+ 
++		uint32_t lba     = l0 | ((uint32_t)l1 << 16);
+ 		reqs++;
++		mount_confirmed = 1;                    // core is live - stop re-strobing
+ 		uint64_t nblk    = f->size >> 9;
+ 		int      is_wr   = (st & 2) ? 1 : 0;
+ 		int      inrange = (f->size && lba < nblk);
+-		int      verbose = (reqs <= 40) || ((reqs & 255) == 0);
++		int      verbose = (reqs <= 40) || ((reqs & 1023) == 0);
+ 
+ 		if (verbose)
+ 			a4log("req #%u %s lba=%u nblk=%llu %s\n", reqs, is_wr ? "WR" : "RD",

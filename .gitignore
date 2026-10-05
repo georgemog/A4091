@@ -1,0 +1,11 @@
+# build products
+*.rbf
+*.o
+build/
+db/
+incremental_db/
+output_files/
+# release binaries live on the GitHub Releases page
+release-assets/
+.DS_Store
+__pycache__/

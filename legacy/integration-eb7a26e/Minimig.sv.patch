@@ -1,0 +1,239 @@
+--- a/Minimig.sv	2026-09-06 16:49:43.337425725 +0100
++++ b/Minimig.sv	2026-09-06 14:08:49.092742295 +0100
+@@ -20,6 +20,8 @@
+ `include "build_id.v" 
+ localparam CONF_STR = {
+ 	"Minimig;UART115200:230400,MIDI;",
++	"S0,HDFIMGHDF,A4091 SCSI Unit 0;",
++	"-;",
+ 	"J,Red(Fire),Blue,Yellow,Green,RT,LT,Pause;",
+ 	"jn,A,B,X,Y,R,L,Start;",
+ 	"jp,B,A,X,Y,R,L,Start;",
+@@ -68,7 +70,13 @@
+ 
+ wire  [7:0] uart_mode;
+ 
+-hps_io #(.CONF_STR(CONF_STR), .CONF_STR_BRAM(0)) hps_io
++// --- A4091 SCSI: hps_io only reports the S3 image mount; sector I/O rides
++//     on hps_ext (cmd 'h64/'h65/'h66/'h67) because Main_MiSTer does not poll
++//     the generic hps_io SD-sector loop for the Minimig core.
++wire        a4091_img_mounted;
++wire [63:0] a4091_img_size;
++
++hps_io #(.CONF_STR(CONF_STR), .CONF_STR_BRAM(0), .VDNUM(1)) hps_io
+ (
+ 	.clk_sys(clk_sys),
+ 	.HPS_BUS({HPS_BUS[45:42],ce_pix,HPS_BUS[40:0]}),
+@@ -84,7 +92,7 @@
+ 	.joystick_3(JOY3),
+ 	.joystick_l_analog_0(JOYA0),
+ 	.joystick_l_analog_1(JOYA1),
+-	
++
+ 	.ioctl_wait(io_wait),
+ 
+ 	.buttons(buttons),
+@@ -95,9 +103,28 @@
+ 	.RTC(RTC),
+ 	.gamma_bus(gamma_bus),
+ 
++	.img_mounted(a4091_img_mounted),
++	.img_size(a4091_img_size),
++
+ 	.EXT_BUS(EXT_BUS)
+ );
+ 
++wire [63:0] a4091_dbg_bus;
++
++// ---- A4091 software-SIOP bridge mailbox (hps_ext <-> cpu_wrapper/a4091) ----
++// The 53C710 model + SCRIPTS VM + SCSI-2 emulation run on the HPS ARM
++// (a4091_hps_thread). The FPGA side is just a 256-byte shadow register RAM
++// plus a kick flag and an IRQ line (a4091_bridge.v). No sector server, no
++// per-ID geometry store - the ARM owns geometry (it has the .hdf sizes).
++wire  [7:0] a4091_mbx_addr;
++wire        a4091_mbx_regs_wr;
++wire  [7:0] a4091_mbx_wdata;
++wire  [7:0] a4091_mbx_rdata;
++wire        a4091_mbx_set_int, a4091_mbx_clr_int, a4091_mbx_clr_kick, a4091_mbx_clr_srst;
++wire        a4091_mbx_cache_clr;
++wire        a4091_cache_clr;
++wire [15:0] a4091_mbx_status;
++
+ wire [15:0] ide_din;
+ wire [15:0] ide_dout;
+ wire  [4:0] ide_addr;
+@@ -106,7 +133,24 @@
+ wire  [5:0] ide_req;
+ 
+ wire [35:0] EXT_BUS;
+-hps_ext hps_ext(.*, .ide_req(ide_fast ? ide_f_req : ide_c_req),  .ide_din(ide_fast ? ide_f_readdata : ide_c_readdata));
++hps_ext hps_ext
++(
++	.*,
++	.ide_req(ide_fast ? ide_f_req : ide_c_req),
++	.ide_din(ide_fast ? ide_f_readdata : ide_c_readdata),
++
++	.a4091_mbx_status  (a4091_mbx_status),
++	.a4091_mbx_addr    (a4091_mbx_addr),
++	.a4091_mbx_regs_wr (a4091_mbx_regs_wr),
++	.a4091_mbx_wdata   (a4091_mbx_wdata),
++	.a4091_mbx_rdata   (a4091_mbx_rdata),
++	.a4091_mbx_set_int (a4091_mbx_set_int),
++	.a4091_mbx_clr_int (a4091_mbx_clr_int),
++	.a4091_mbx_clr_kick(a4091_mbx_clr_kick),
++	.a4091_mbx_clr_srst(a4091_mbx_clr_srst),
++	.a4091_mbx_cache_clr(a4091_mbx_cache_clr),
++	.a4091_dbg_bus     (a4091_dbg_bus)
++);
+ 
+ assign LED_POWER[1] = 1;
+ assign LED_DISK     = {1'b0, ide_fast ? ide_f_led : ide_c_led};
+@@ -258,6 +302,8 @@
+ wire  [1:0] cpu_state;
+ wire        cpu_nrst_out;
+ wire  [3:0] cpu_cacr;
++reg   [3:0] cpu_cacr_a4091;
++always @(posedge clk_sys) cpu_cacr_a4091 <= cpu_cacr | {a4091_cache_clr, 3'b000};
+ wire [31:0] cpu_nmi_addr;
+ wire        cpu_rst;
+ 
+@@ -280,10 +326,25 @@
+ wire        ram_ready = zram_sel ? ram_ready2 : ram_ready1;
+ wire        zram_sel  = |ram_addr[28:26];
+ wire        ramshared;
++wire        ramcinhibit;
++wire        a4091_dmaCS, a4091_dmaWE, a4091_dmaU, a4091_dmaL, a4091_dmaACK;
++wire [28:1] a4091_dmaAddr;
++wire [15:0] a4091_dmaWR, a4091_dmaRD;
++wire        a4091_sdmaCS, a4091_sdmaACK;
++wire [24:1] a4091_sdmaAddr;
++wire [15:0] a4091_sdmaRD;
+ 
+ wire [7:0] toccata_base;
+ wire toccata_ena;
+ 
++// A4091 Zorro III NCR 53C710 SCSI - SOFTWARE SIOP (see A4091/software-siop-*).
++// FPGA side = autoconfig + boot ROM + register window + the a4091_bridge
++// shadow-register RAM / kick / IRQ. The 53C710 model, SCRIPTS VM and SCSI-2
++// emulation (up to 6 targets, IDs 1..6, each an .hdf from the OSD "A4091 SCSI"
++// section) run on the HPS ARM (a4091_hps_thread). O[57] gates autoconfig.
++wire        a4091_ena = status[57];
++wire        a4091_int2;
++
+ cpu_wrapper cpu_wrapper
+ (
+ 	.reset        (cpu_rst         ),
+@@ -328,11 +389,45 @@
+ 	.ramdin       (ram_din         ),
+ 	.ramready     (ram_ready       ),
+ 	.ramshared    (ramshared       ),
++	.ramcinhibit  (ramcinhibit     ),
++	.a4091_dmaCS  (a4091_dmaCS     ),
++	.a4091_dmaWE  (a4091_dmaWE     ),
++	.a4091_dmaU   (a4091_dmaU      ),
++	.a4091_dmaL   (a4091_dmaL      ),
++	.a4091_dmaAddr(a4091_dmaAddr   ),
++	.a4091_dmaWR  (a4091_dmaWR     ),
++	.a4091_dmaRD  (a4091_dmaRD     ),
++	.a4091_dmaACK (a4091_dmaACK    ),
++	.a4091_sdmaCS  (a4091_sdmaCS   ),
++	.a4091_sdmaAddr(a4091_sdmaAddr ),
++	.a4091_sdmaRD  (a4091_sdmaRD   ),
++	.a4091_sdmaACK (a4091_sdmaACK  ),
+ 
+ 	//custom CPU signals
+ 	.cpustate     (cpu_state       ),
+ 	.cacr         (cpu_cacr        ),
+-	.nmi_addr     (cpu_nmi_addr    )
++	.nmi_addr     (cpu_nmi_addr    ),
++
++	// A4091 SCSI - software SIOP bridge
++	.a4091_ena     (a4091_ena       ),
++	.a4091_scsi_id (3'd7            ),
++	.a4091_dip     (5'b00000        ),
++	.a4091_int2    (a4091_int2      ),
++	.a4091_rom_wr  (1'b0            ),   // ROM preloaded via A4091_ROM_HEX macro
++	.a4091_rom_addr(16'd0           ),
++	.a4091_rom_data(8'd0            ),
++	.a4091_mbx_addr    (a4091_mbx_addr    ),
++	.a4091_mbx_regs_wr (a4091_mbx_regs_wr ),
++	.a4091_mbx_wdata   (a4091_mbx_wdata   ),
++	.a4091_mbx_rdata   (a4091_mbx_rdata   ),
++	.a4091_mbx_set_int (a4091_mbx_set_int ),
++	.a4091_mbx_clr_int (a4091_mbx_clr_int ),
++	.a4091_mbx_clr_kick(a4091_mbx_clr_kick),
++	.a4091_mbx_clr_srst(a4091_mbx_clr_srst),
++	.a4091_mbx_cache_clr(a4091_mbx_cache_clr),
++	.a4091_cache_clr   (a4091_cache_clr   ),
++	.a4091_mbx_status  (a4091_mbx_status  ),
++	.a4091_dbg_bus(a4091_dbg_bus)
+ );
+ 
+ wire [15:0] ram_dout1;
+@@ -345,7 +440,8 @@
+ 	.c_7m         (c1              ),
+ 
+ 	.cache_rst    (cpu_rst         ),
+-	.cpu_cache_ctrl(cpu_cacr       ),
++	.cache_inhibit(ramcinhibit     ),
++	.cpu_cache_ctrl(cpu_cacr_a4091 ),
+ 
+ 	.sd_data      (SDRAM_DQ        ),
+ 	.sd_addr      (SDRAM_A         ),
+@@ -367,6 +463,15 @@
+ 	.cpuRD        (ram_dout1       ),
+ 	.ramready     (ram_ready1      ),
+ 
++	.dmaAddr      (a4091_sdmaAddr  ),
++	.dmaCS        (a4091_sdmaCS    ),
++	.dmaWE        (a4091_dmaWE     ),
++	.dmaL         (a4091_dmaL      ),
++	.dmaU         (a4091_dmaU      ),
++	.dmaWR        (a4091_dmaWR     ),
++	.dmaRD        (a4091_sdmaRD    ),
++	.dmaACK       (a4091_sdmaACK   ),
++
+ 	.chipWR       (ram_data        ),
+ 	.chipAddr     (ram_address     ),
+ 	.chipU        (_ram_bhe        ),
+@@ -387,7 +492,8 @@
+ 	.reset_n      (~reset_d        ),
+ 
+ 	.cache_rst    (cpu_rst         ),
+-	.cpu_cache_ctrl(cpu_cacr       ),
++	.cache_inhibit(ramcinhibit     ),
++	.cpu_cache_ctrl(cpu_cacr_a4091 ),
+ 
+ 	.DDRAM_CLK    (DDRAM_CLK       ),
+ 	.DDRAM_BUSY   (DDRAM_BUSY      ),
+@@ -408,8 +514,18 @@
+ 	.cpuCS        (zram_sel&ram_cs ),
+ 	.cpuRD        (ram_dout2       ),
+ 	.ramshared    (ramshared       ),
+-	.ramready     (ram_ready2      )
++	.dmaAddr      (a4091_dmaAddr   ),
++	.dmaCS        (a4091_dmaCS     ),
++	.dmaWE        (a4091_dmaWE     ),
++	.dmaL         (a4091_dmaL      ),
++	.dmaU         (a4091_dmaU      ),
++	.dmaWR        (a4091_dmaWR     ),
++	.dmaRD        (a4091_dmaRD     ),
++	.dmaACK       (a4091_dmaACK    ),
++	.ramready     (ram_ready2      ),
++	.a4091_dma_timeout_cnt(a4091_ddr_timeout_cnt)
+ );
++wire [15:0] a4091_ddr_timeout_cnt;   // DEBUG (JOURNAL 20260905) - see ddram_ctrl.v
+ 
+ wire [15:0] fastchip_dout;
+ wire        fastchip_sel;
+@@ -633,7 +749,9 @@
+ 	.ide_write    (ide_wr           ),
+ 	.ide_writedata(ide_dout         ),
+ 	.ide_read     (ide_rd           ),
+-	.ide_readdata (ide_c_readdata   )
++	.ide_readdata (ide_c_readdata   ),
++
++	.a4091_int2   (a4091_int2       )
+ );
+ 
+ // power led control

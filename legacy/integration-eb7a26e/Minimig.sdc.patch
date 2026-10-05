@@ -1,0 +1,19 @@
+--- a/Minimig.sdc
++++ b/Minimig.sdc
+@@ -3,6 +3,15 @@ derive_clock_uncertainty
+
+ set_multicycle_path -from {emu|cpu_wrapper|cpu_inst*} -to {emu|ram*} -setup 2
+ set_multicycle_path -from {emu|cpu_wrapper|cpu_inst*} -to {emu|ram*} -hold 1
+
++# A4091 bus-master DMA shares the CPU->RAM port and holds its address
++# stable across clk_114 cycles while waiting for ramready - same contract
++# as the CPU, so the same multicycle applies. a4091_inst|* covers the
++# SIOP-side signals; a4091_dma_* covers the cpu_wrapper-side hold /
++# arm-delay regs (a4091_dma_go/tail/arm/armed) that gate ramsel.
++set_multicycle_path -from {emu|cpu_wrapper|a4091_inst|*} -to {emu|ram*} -setup 2
++set_multicycle_path -from {emu|cpu_wrapper|a4091_inst|*} -to {emu|ram*} -hold 1
++set_multicycle_path -from {emu|cpu_wrapper|a4091_dma_*} -to {emu|ram*} -setup 2
++set_multicycle_path -from {emu|cpu_wrapper|a4091_dma_*} -to {emu|ram*} -hold 1
++
+ set_multicycle_path -from {emu|amiga_clk|cck*} -to {emu|ram1|*} -setup 2
+ set_multicycle_path -from {emu|amiga_clk|cck*} -to {emu|ram1|*} -hold 1

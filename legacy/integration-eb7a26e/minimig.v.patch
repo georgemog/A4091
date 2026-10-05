@@ -1,0 +1,24 @@
+diff --git a/rtl/minimig.v b/rtl/minimig.v
+index 16387b4..c95b6c1 100644
+--- a/rtl/minimig.v
++++ b/rtl/minimig.v
+@@ -262,7 +262,9 @@ module minimig
+ 	input         ide_write,
+ 	input  [15:0] ide_writedata,
+ 	input         ide_read,
+-	output [15:0] ide_readdata
++	output [15:0] ide_readdata,
++
++	input         a4091_int2
+ );
+ 
+ 
+@@ -488,7 +490,7 @@ paula PAULA1
+ 	.sof(sof),
+ 	.strhor(strhor_paula),
+ 	.vblint(vbl_int),
+-	.int2(int2|(ide_fast ? ide_ext_irq : gayle_irq)),
++	.int2(int2|(ide_fast ? ide_ext_irq : gayle_irq)|a4091_int2),
+ 	.int3(int3),
+ 	.int6(int6 | int6_toccata),
+ 	._ipl(_iplx),

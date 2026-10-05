@@ -1,0 +1,288 @@
+diff --git a/support/minimig/minimig_a4091.cpp b/support/minimig/minimig_a4091.cpp
+new file mode 100644
+index 0000000..b18fb49
+--- /dev/null
++++ b/support/minimig/minimig_a4091.cpp
+@@ -0,0 +1,233 @@
++// A4091 SCSI host adapter support for the Minimig core - host half.
++// See minimig_a4091.h for the overview.
++
++#include <stdio.h>
++#include <stdint.h>
++#include <string.h>
++#include <stdarg.h>
++#include <fcntl.h>
++
++#include "../../spi.h"
++#include "../../user_io.h"
++#include "../../file_io.h"
++#include "../../fpga_io.h"
++#include "minimig_config.h"
++#include "minimig_a4091.h"
++
++// ---------------------------------------------------------------------------
++// Debug: the a4log trace file and the per-request 0x68 SIOP snapshot. Both
++// cost SPI traffic in the sector-serve hot path, so a release build leaves
++// them out. Flip this to build the diagnostic version (writes
++// /media/usb0/a4091_sd.log).
++// ---------------------------------------------------------------------------
++#define A4091_DEBUG 1
++
++// SCSI IDs 1..6 map to a4091_img[0..5]. ID 0 is the HBA.
++#define A4091_NDRV 6
++
++// hps_ext SPI mailbox commands (raw spi_w, not UIO_*):
++//   0x64 poll  -> {8'b0, id[2:0]@5, wr_pending@1, rd_pending@0}; then lba lo/hi
++//   0x65 HPS -> FPGA sector data (512 B, fast block SPI)
++//   0x66 FPGA -> HPS sector data (512 B)
++//   0x67 pulse blk_done
++//   0x68 SIOP 64-bit debug snapshot (4 words)
++//   0x69 per-ID geometry push: w1={_,present@8,id[2:0]}, w2/w3 = blocks lo/hi
++
++static fileTYPE a4091_img[A4091_NDRV];
++static uint64_t a4091_size[A4091_NDRV];
++
++// ---------------------------------------------------------------------------
++#if A4091_DEBUG
++
++static void a4log(const char *fmt, ...)
++{
++	static FILE *lf = NULL;
++	static int   tried = 0;
++	if (!lf && !tried)
++	{
++		tried = 1;
++		lf = fopen("/media/usb0/a4091_sd.log", "w");
++		if (lf) { setvbuf(lf, NULL, _IOLBF, 0); fprintf(lf, "--- a4091_sd log start ---\n"); }
++	}
++	if (!lf) return;
++	va_list ap; va_start(ap, fmt);
++	vfprintf(lf, fmt, ap);
++	va_end(ap);
++	fflush(lf);
++}
++
++// Read the SIOP 64-bit debug bus (hps_ext cmd 0x68) and log it whenever the
++// compact state key changes, plus a heartbeat. HPS<->FPGA only, so it
++// survives an Amiga wedge.
++static void a4091_dbg_snapshot(uint32_t polls, uint16_t sd_st, uint32_t lba)
++{
++	EnableIO();
++	uint16_t w0 = spi_w(0x0068);
++	uint16_t w1 = spi_w(0);
++	uint16_t w2 = spi_w(0);
++	uint16_t w3 = spi_w(0);
++	DisableIO();
++
++	uint8_t  st      =  w0 & 0x3f;
++	uint8_t  dma_req  = (w0 >> 6) & 1;
++	uint8_t  idle     = (w0 >> 7) & 1;
++	uint8_t  dstat    = (w0 >> 8) & 0xff;
++	uint8_t  phase    =  w1 & 7;
++	uint8_t  reason   = (w1 >> 3) & 0x1f;
++	uint8_t  dien     = (w1 >> 8) & 0xff;
++	uint8_t  kicks    =  w2 & 0xff;
++	uint8_t  sels     = (w2 >> 8) & 0xff;
++	uint16_t lastint  = w3;
++
++	static uint32_t last_key = 0xffffffff;
++	static uint32_t last_hb  = 0;
++	uint32_t key = st | (phase << 6) | (dstat << 9) | (reason << 17)
++	             | (dma_req << 22) | (idle << 23) | ((sd_st & 0xff) << 24)
++	             | ((uint32_t)(lastint & 0xff) << 25);
++
++	if (key != last_key || (polls - last_hb) >= 0x4000)
++	{
++		last_key = key;
++		last_hb  = polls;
++		a4log("DBG p=%u siop_st=%u ph=%u idle=%u dreq=%u dstat=%02x rsn=%02x "
++		      "dien=%02x kick=%u sel=%u INT=%04x | sd=%04x lba=%u\n",
++		      polls, st, phase, idle, dma_req, dstat, reason,
++		      dien, kicks, sels, lastint, sd_st, lba);
++	}
++}
++
++#else
++static inline void a4log(const char *, ...) {}
++static inline void a4091_dbg_snapshot(uint32_t, uint16_t, uint32_t) {}
++#endif
++
++// ---------------------------------------------------------------------------
++// Push one drive's geometry to the FPGA (hps_ext 0x69). blocks==0 / !present
++// clears the slot: the SIOP then STOs a SELECT for that ID.
++static void a4091_push_geo(int id, int present, uint32_t blocks)
++{
++	EnableIO();
++	spi_w(0x0069);
++	spi_w((uint16_t)(((present ? 1 : 0) << 8) | (id & 7)));
++	spi_w((uint16_t)(blocks & 0xffff));
++	spi_w((uint16_t)(blocks >> 16));
++	DisableIO();
++}
++
++// (Re)open the configured .hdf images and push all 6 slots' geometry.
++void a4091_apply_config(void)
++{
++	int enabled = (minimig_config.scsi_cfg & 1);
++
++	for (int i = 0; i < A4091_NDRV; i++)
++	{
++		if (a4091_img[i].opened()) FileClose(&a4091_img[i]);
++		a4091_size[i] = 0;
++
++		const mm_hardfileTYPE *hf = &minimig_config.scsi[i];
++		int want = enabled && hf->cfg == 1 && hf->filename[0];
++
++		if (want && FileOpenEx(&a4091_img[i], hf->filename,
++		                       FileCanWrite(hf->filename) ? O_RDWR : O_RDONLY))
++		{
++			a4091_size[i] = a4091_img[i].size;
++			a4log("ID%d = \"%s\"  %llu bytes (%llu MB)\n", i + 1, a4091_img[i].name,
++			      (unsigned long long)a4091_size[i], (unsigned long long)(a4091_size[i] >> 20));
++		}
++		else if (want)
++		{
++			a4log("ID%d open FAILED: \"%s\"\n", i + 1, hf->filename);
++		}
++
++		uint32_t blocks = (uint32_t)(a4091_size[i] >> 9);
++		a4091_push_geo(i + 1, a4091_size[i] != 0, blocks);
++	}
++
++	a4log("apply: A4091 SCSI %s\n", enabled ? "enabled" : "disabled");
++}
++
++// ---------------------------------------------------------------------------
++
++void a4091_sd_poll(void)
++{
++	static uint32_t polls    = 0;
++	static uint32_t last_lba = 0xffffffff;
++	static uint32_t reqs     = 0;
++	static uint8_t  a4buf[512];
++
++	polls++;
++
++	if ((polls & 0x3fff) == 0) a4091_dbg_snapshot(polls, 0, 0);
++
++	// ---- hps_ext sector mailbox ------------------------------------------
++	// 0x64 poll -> {id, wr_pending, rd_pending} + lba; serve one 512 B block
++	// per pending request (0x65 HPS->FPGA read, 0x66 FPGA->HPS write), then
++	// pulse 0x67. Only advance once a4091_sd's lba changes - it is stale for
++	// many FPGA cycles after a 0x67.
++	for (int guard = 0; guard < 64; guard++)
++	{
++		EnableIO();
++		uint16_t st = spi_w(0x0064);
++		uint16_t l0 = spi_w(0);
++		uint16_t l1 = spi_w(0);
++		DisableIO();
++		if (!(st & 3)) { last_lba = 0xffffffff; break; }
++
++		uint32_t lba = l0 | ((uint32_t)l1 << 16);
++		if (lba == last_lba) break;
++		last_lba = lba;
++		reqs++;
++
++		int      id      = (st >> 5) & 7;               // SCSI ID 1..6
++		int      is_wr   = (st & 2) ? 1 : 0;
++		fileTYPE *f       = (id >= 1 && id <= A4091_NDRV) ? &a4091_img[id - 1] : 0;
++		uint64_t nblk    = (f && f->opened()) ? (f->size >> 9) : 0;
++		int      inrange = (nblk && lba < nblk);
++		int      verbose = (reqs <= 40) || ((reqs & 1023) == 0);
++
++		if (verbose)
++		{
++			a4091_dbg_snapshot(polls, st, lba);
++			a4log("req #%u ID%d %s lba=%u nblk=%llu %s\n", reqs, id, is_wr ? "WR" : "RD",
++			      lba, (unsigned long long)nblk, inrange ? "" : "OUT-OF-RANGE");
++		}
++
++		if (is_wr)
++		{
++			EnableIO();
++			spi_w(0x0066);
++			spi_block_read(a4buf, 0, 512);   // fast (fpga_spi_fast) block SPI
++			DisableIO();
++			if (inrange && FileSeek(f, (__off64_t)lba << 9, SEEK_SET))
++			{
++				diskled_on();
++				int n = FileWriteAdv(f, a4buf, 512);
++				if (verbose)
++					a4log("  WR ID%d lba=%u -> %d  %02x %02x %02x %02x\n",
++					      id, lba, n, a4buf[0], a4buf[1], a4buf[2], a4buf[3]);
++			}
++			else if (verbose) a4log("  WR skipped (range/seek)\n");
++		}
++		else
++		{
++			memset(a4buf, 0, sizeof(a4buf));
++			if (inrange && FileSeek(f, (__off64_t)lba << 9, SEEK_SET))
++			{
++				diskled_on();
++				int n = FileReadAdv(f, a4buf, 512);
++				if (verbose)
++					a4log("  RD ID%d lba=%u -> %d  %02x %02x %02x %02x\n",
++					      id, lba, n, a4buf[0], a4buf[1], a4buf[2], a4buf[3]);
++			}
++			else if (verbose) a4log("  RD zero-fill (range/seek)\n");
++			EnableIO();
++			spi_w(0x0065);
++			spi_block_write(a4buf, 0, 512);
++			DisableIO();
++		}
++
++		EnableIO();
++		spi_w(0x0067);                       // pulse blk_done
++		DisableIO();
++	}
++}
+diff --git a/support/minimig/minimig_a4091.h b/support/minimig/minimig_a4091.h
+new file mode 100644
+index 0000000..a5787df
+--- /dev/null
++++ b/support/minimig/minimig_a4091.h
+@@ -0,0 +1,23 @@
++#ifndef MINIMIG_A4091_H
++#define MINIMIG_A4091_H
++
++// A4091 SCSI host adapter support for the Minimig core.
++//
++// The FPGA side (rtl/a4091/*.v) implements the Zorro III board, the NCR
++// 53C710 SIOP and virtual SCSI-2 direct-access targets. This module is the
++// host half: it opens up to 6 .hdf images (SCSI IDs 1..6, chosen in the OSD
++// "A4091 SCSI" section) and serves their 512-byte sector requests over the
++// hps_ext mailbox (SPI cmds 0x64 poll / 0x65 HPS->FPGA / 0x66 FPGA->HPS /
++// 0x67 block-done / 0x68 SIOP debug snapshot / 0x69 per-ID geometry push).
++//
++// Runs in Main's single thread, driven by a4091_sd_poll() from the poll loop.
++// a4091_apply_config() (re)opens the images and pushes geometry - call it
++// from ApplyConfiguration and after an OSD change.
++//
++// Debug logging (a4log + the 0x68 SIOP snapshot) is compiled in only when
++// A4091_DEBUG is defined - see the toggle at the top of minimig_a4091.cpp.
++
++void a4091_sd_poll(void);
++void a4091_apply_config(void);
++
++#endif
+diff --git a/user_io.cpp b/user_io.cpp
+index 511c7a4..669c8df 100644
+--- a/user_io.cpp
++++ b/user_io.cpp
+@@ -35,6 +35,7 @@
+ #include "ide.h"
+ #include "ide_cdrom.h"
+ #include "support/minimig/akiko_cd32.h"
++#include "support/minimig/minimig_a4091.h"
+ #include "support/minimig/cdtv_cd.h"
+ #ifdef PROFILING
+ #include "profiling.h"
+@@ -3209,6 +3210,7 @@ void user_io_poll()
+ 
+ 		minimig_share_poll();
+ 		a2065_poll();
++		a4091_sd_poll();
+ 	}
+ 
+ 	if (core_type == CORE_TYPE_8BIT && !is_menu())
