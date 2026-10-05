@@ -36,8 +36,8 @@ with no Makefile edit.
 
 ```
 cd Main_MiSTer
-git apply /path/to/Minimig-AGA-A4091/main_mister/main_mister_swsiop.patch
-cp /path/to/Minimig-AGA-A4091/main_mister/{a4091_lsi.cpp,a4091_lsi_glue.h,a4091_queue.h,a4091_scsi.cpp,a4091_scsi_defs.h,minimig_a4091.cpp,minimig_a4091.h} support/minimig/
+git apply /path/to/A4091/main_mister/main_mister_swsiop.patch
+cp /path/to/A4091/main_mister/{a4091_lsi.cpp,a4091_lsi_glue.h,a4091_queue.h,a4091_scsi.cpp,a4091_scsi_defs.h,minimig_a4091.cpp,minimig_a4091.h} support/minimig/
 export PATH=/opt/armV7-linux-gcc/bin:$PATH
 make -j4
 ```

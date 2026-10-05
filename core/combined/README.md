@@ -95,8 +95,8 @@ are copied in unchanged from `../../rtl/`.
 # on the Quartus server (quartus-host)
 git -C ~/Development/Minimig-AGA_MiSTer_rtg worktree add -b a4091-rtg-a2065 /tmp/mm-combined rtg-z3
 cd /tmp/mm-combined
-git apply /path/to/Minimig-AGA-A4091/core/combined/a4091-on-rtgz3.patch
-mkdir -p rtl/a4091 && cp /path/to/Minimig-AGA-A4091/rtl/{a4091.v,a4091_bridge.v,a4091_rom.mif} rtl/a4091/
+git apply /path/to/A4091/core/combined/a4091-on-rtgz3.patch
+mkdir -p rtl/a4091 && cp /path/to/A4091/rtl/{a4091.v,a4091_bridge.v,a4091_rom.mif} rtl/a4091/
 printf '`define BUILD_DATE "%s"' $(date +%y%m%d) > build_id.v   # PRE_FLOW normally does this
 /opt/altera/17.0/quartus/bin/quartus_sh --flow compile Minimig 2>&1 | tee logs/combined_build.log
 ```
